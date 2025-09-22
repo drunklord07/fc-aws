@@ -1,0 +1,156 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import os
+import csv
+from collections import defaultdict, Counter
+
+# ========= CONFIGURATION ========= #
+INPUT_FOLDER = "prowler_outputs"      # Hardcoded input folder (must contain 4 CSVs)
+OUTPUT_FILE = "comparison_report.txt" # Hardcoded output file name
+EXPECTED_FILES = 4
+# ================================= #
+
+def load_csv(filepath):
+    """Load Prowler CSV file into dict keyed by (resource_uid, check_id)."""
+    data = {}
+    totals = Counter()
+    with open(filepath, newline='', encoding="utf-8") as f:
+        reader = csv.DictReader(f, delimiter=';')
+        for row in reader:
+            check_id = row.get("CHECK_ID", "").strip()
+            check_title = row.get("CHECK_TITLE", "").strip()
+            resource_uid = row.get("RESOURCE_UID", "").strip()
+            resource_name = row.get("RESOURCE_NAME", "").strip()
+            status = row.get("STATUS", "").strip().upper()
+            muted = row.get("MUTED", "").strip().upper()
+
+            if not resource_uid or not check_id:
+                continue
+
+            key = (resource_uid, check_id)
+            data[key] = {
+                "check_id": check_id,
+                "check_title": check_title,
+                "resource_uid": resource_uid,
+                "resource_name": resource_name,
+                "status": status,
+                "muted": muted == "TRUE" or status == "MUTED",
+            }
+
+            # Count for summary
+            totals[status] += 1
+            if muted == "TRUE" or status == "MUTED":
+                totals["MUTED"] += 1
+    return data, totals
+
+def main():
+    # Collect CSV files
+    files = [os.path.join(INPUT_FOLDER, f) for f in os.listdir(INPUT_FOLDER) if f.endswith(".csv")]
+    files.sort()
+    if len(files) != EXPECTED_FILES:
+        raise RuntimeError(f"Expected {EXPECTED_FILES} CSVs in {INPUT_FOLDER}, found {len(files)}")
+
+    file_labels = [os.path.basename(f) for f in files]  # keep filenames for labeling
+
+    # Load all CSVs
+    datasets, file_totals = [], []
+    for f in files:
+        data, totals = load_csv(f)
+        datasets.append(data)
+        file_totals.append(totals)
+
+    # Collect all unique keys
+    all_keys = set()
+    for data in datasets:
+        all_keys.update(data.keys())
+
+    differences = []
+    per_check_stats = defaultdict(lambda: Counter())
+
+    # Compare across files
+    for key in sorted(all_keys, key=lambda x: (x[1], x[0])):  # sort by check_id then resource_uid
+        statuses, muted_flags = [], []
+        check_id, resource_uid = key[1], key[0]
+        check_title, resource_name = "", ""
+
+        for data in datasets:
+            entry = data.get(key)
+            if entry:
+                statuses.append(entry["status"])
+                muted_flags.append(entry["muted"])
+                check_title = entry["check_title"]
+                resource_name = entry["resource_name"]
+            else:
+                statuses.append("MISSING")
+                muted_flags.append(False)
+
+        flags = []
+        if len(set(statuses)) > 1:
+            flags.append("DIFFERENT")
+            per_check_stats[check_id]["mismatches"] += 1
+        if any(s == "MISSING" for s in statuses):
+            flags.append("MISSING")
+            per_check_stats[check_id]["missing"] += 1
+        if any(muted_flags):
+            flags.append("MUTED")
+            per_check_stats[check_id]["muted"] += 1
+
+        if flags:
+            differences.append({
+                "resource_uid": resource_uid,
+                "resource_name": resource_name,
+                "check_id": check_id,
+                "check_title": check_title,
+                "statuses": statuses,
+                "flags": flags
+            })
+
+    # ===== Write Report ===== #
+    with open(OUTPUT_FILE, "w", encoding="utf-8") as out:
+        out.write("===== SUMMARY =====\n")
+        for i, (totals, fname) in enumerate(zip(file_totals, file_labels), 1):
+            out.write(
+                f"{fname} → PASS: {totals['PASS']}, FAIL: {totals['FAIL']}, "
+                f"WARN: {totals['WARN']}, MUTED: {totals['MUTED']}\n"
+            )
+        out.write("\n")
+        out.write(
+            f"Total mismatches: {sum(v['mismatches'] for v in per_check_stats.values())}\n"
+            f"Total missing resources: {sum(v['missing'] for v in per_check_stats.values())}\n"
+            f"Total muted findings: {sum(v['muted'] for v in per_check_stats.values())}\n\n"
+        )
+
+        out.write("===== DETAILED DIFFERENCES =====\n")
+        for diff in differences:
+            out.write(f"ResourceUID: {diff['resource_uid']}\n")
+            out.write(f"ResourceName: {diff['resource_name']}\n")
+            out.write(f"CheckID: {diff['check_id']}\n")
+            out.write(f"CheckTitle: {diff['check_title']}\n")
+            for fname, status in zip(file_labels, diff["statuses"]):
+                out.write(f"{fname}: {status}\n")
+            out.write(f"→ Flags: {', '.join(diff['flags'])}\n\n")
+
+        out.write("===== PER-CHECK DIFFERENCES =====\n")
+        for check_id, stats in per_check_stats.items():
+            parts = []
+            if stats["mismatches"]:
+                parts.append(f"{stats['mismatches']} mismatches")
+            if stats["missing"]:
+                parts.append(f"{stats['missing']} missing")
+            if stats["muted"]:
+                parts.append(f"{stats['muted']} muted")
+            if parts:
+                out.write(f"{check_id} → {', '.join(parts)}\n")
+
+        out.write("\n===== OVERALL TOTALS =====\n")
+        out.write(
+            f"Total mismatches: {sum(v['mismatches'] for v in per_check_stats.values())}\n"
+            f"Total missing resources: {sum(v['missing'] for v in per_check_stats.values())}\n"
+            f"Total muted findings: {sum(v['muted'] for v in per_check_stats.values())}\n"
+        )
+
+    print(f"Comparison report written to {OUTPUT_FILE}")
+
+if __name__ == "__main__":
+    main()
