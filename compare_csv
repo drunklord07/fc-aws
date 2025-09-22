@@ -42,6 +42,7 @@ def load_csv(filepath):
             totals[status] += 1
             if muted == "TRUE" or status == "MUTED":
                 totals["MUTED"] += 1
+        totals["TOTAL"] = sum(totals.values())
     return data, totals
 
 def main():
@@ -67,11 +68,12 @@ def main():
 
     differences = []
     per_check_stats = defaultdict(lambda: Counter())
+    checkid_to_title = {}
 
     # Compare across files
-    for key in sorted(all_keys, key=lambda x: (x[1], x[0])):  # sort by check_id then resource_uid
+    for key in all_keys:  # maintain natural order (first file order)
+        resource_uid, check_id = key
         statuses, muted_flags = [], []
-        check_id, resource_uid = key[1], key[0]
         check_title, resource_name = "", ""
 
         for data in datasets:
@@ -105,32 +107,50 @@ def main():
                 "statuses": statuses,
                 "flags": flags
             })
+            checkid_to_title[check_id] = check_title
+
+    # Count totals
+    total_mismatches = sum(v["mismatches"] for v in per_check_stats.values())
+    total_missing = sum(v["missing"] for v in per_check_stats.values())
+    total_muted = sum(v["muted"] for v in per_check_stats.values())
+    controls_with_diffs = len(per_check_stats)
+    unique_controls = len({cid for _, cid in all_keys})
 
     # ===== Write Report ===== #
     with open(OUTPUT_FILE, "w", encoding="utf-8") as out:
+        # --- Summary ---
         out.write("===== SUMMARY =====\n")
-        for i, (totals, fname) in enumerate(zip(file_totals, file_labels), 1):
+        for fname, totals in zip(file_labels, file_totals):
             out.write(
                 f"{fname} → PASS: {totals['PASS']}, FAIL: {totals['FAIL']}, "
-                f"WARN: {totals['WARN']}, MUTED: {totals['MUTED']}\n"
+                f"WARN: {totals['WARN']}, MUTED: {totals['MUTED']}, TOTAL: {totals['TOTAL']}\n"
             )
         out.write("\n")
         out.write(
-            f"Total mismatches: {sum(v['mismatches'] for v in per_check_stats.values())}\n"
-            f"Total missing resources: {sum(v['missing'] for v in per_check_stats.values())}\n"
-            f"Total muted findings: {sum(v['muted'] for v in per_check_stats.values())}\n\n"
+            f"Total mismatches (resources with status differences): {total_mismatches}\n"
+            f"Total missing resources: {total_missing}\n"
+            f"Total muted findings: {total_muted}\n"
+            f"Controls with differences: {controls_with_diffs}\n"
+            f"Unique controls in all files: {unique_controls}\n\n"
         )
 
+        # --- Detailed Section (grouped by control) ---
         out.write("===== DETAILED DIFFERENCES =====\n")
-        for diff in differences:
+        controls_seen = set()
+        for diff in sorted(differences, key=lambda x: (x["check_id"], x["resource_uid"])):
+            cid = diff["check_id"]
+            if cid not in controls_seen:
+                controls_seen.add(cid)
+                out.write(f"\n===== CONTROL: {cid.upper()} =====\n")
+                out.write(f"Title: {diff['check_title']}\n\n")
+
             out.write(f"ResourceUID: {diff['resource_uid']}\n")
             out.write(f"ResourceName: {diff['resource_name']}\n")
-            out.write(f"CheckID: {diff['check_id']}\n")
-            out.write(f"CheckTitle: {diff['check_title']}\n")
             for fname, status in zip(file_labels, diff["statuses"]):
                 out.write(f"{fname}: {status}\n")
             out.write(f"→ Flags: {', '.join(diff['flags'])}\n\n")
 
+        # --- Per-Check Breakdown ---
         out.write("===== PER-CHECK DIFFERENCES =====\n")
         for check_id, stats in per_check_stats.items():
             parts = []
@@ -143,11 +163,14 @@ def main():
             if parts:
                 out.write(f"{check_id} → {', '.join(parts)}\n")
 
+        # --- Overall Totals ---
         out.write("\n===== OVERALL TOTALS =====\n")
         out.write(
-            f"Total mismatches: {sum(v['mismatches'] for v in per_check_stats.values())}\n"
-            f"Total missing resources: {sum(v['missing'] for v in per_check_stats.values())}\n"
-            f"Total muted findings: {sum(v['muted'] for v in per_check_stats.values())}\n"
+            f"Total mismatches: {total_mismatches}\n"
+            f"Total missing resources: {total_missing}\n"
+            f"Total muted findings: {total_muted}\n"
+            f"Controls with differences: {controls_with_diffs}\n"
+            f"Unique controls in all files: {unique_controls}\n"
         )
 
     print(f"Comparison report written to {OUTPUT_FILE}")
