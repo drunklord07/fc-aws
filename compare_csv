@@ -15,15 +15,30 @@ def load_csv(filepath):
     """Load Prowler CSV file into dict keyed by (resource_uid, check_id)."""
     data = {}
     totals = Counter()
+    issues = []
+    check_ids = set()
+
     with open(filepath, newline='', encoding="utf-8") as f:
         reader = csv.DictReader(f, delimiter=';')
-        for row in reader:
+        for line_num, row in enumerate(reader, start=2):  # start=2 to account for header
             check_id = row.get("CHECK_ID", "").strip()
             check_title = row.get("CHECK_TITLE", "").strip()
             resource_uid = row.get("RESOURCE_UID", "").strip()
             resource_name = row.get("RESOURCE_NAME", "").strip()
             status = row.get("STATUS", "").strip().upper()
             muted = row.get("MUTED", "").strip().upper()
+
+            # Track coverage
+            if check_id:
+                check_ids.add(check_id)
+
+            # Data quality checks
+            if not check_id:
+                issues.append(f"{os.path.basename(filepath)} line {line_num} → missing CHECK_ID")
+            if not resource_uid:
+                issues.append(f"{os.path.basename(filepath)} line {line_num} → missing RESOURCE_UID")
+            if status not in {"PASS", "FAIL", "WARN", "MUTED", ""}:
+                issues.append(f"{os.path.basename(filepath)} line {line_num} → invalid STATUS: {status}")
 
             if not resource_uid or not check_id:
                 continue
@@ -43,7 +58,8 @@ def load_csv(filepath):
             if muted == "TRUE" or status == "MUTED":
                 totals["MUTED"] += 1
         totals["TOTAL"] = sum(totals.values())
-    return data, totals
+    return data, totals, check_ids, issues
+
 
 def main():
     # Collect CSV files
@@ -52,26 +68,29 @@ def main():
     if len(files) != EXPECTED_FILES:
         raise RuntimeError(f"Expected {EXPECTED_FILES} CSVs in {INPUT_FOLDER}, found {len(files)}")
 
-    file_labels = [os.path.basename(f) for f in files]  # keep filenames for labeling
+    file_labels = [os.path.basename(f) for f in files]
 
     # Load all CSVs
-    datasets, file_totals = [], []
+    datasets, file_totals, file_checks, file_issues = [], [], [], []
     for f in files:
-        data, totals = load_csv(f)
+        data, totals, checks, issues = load_csv(f)
         datasets.append(data)
         file_totals.append(totals)
+        file_checks.append(checks)
+        file_issues.extend(issues)
 
-    # Collect all unique keys
+    # Collect all unique keys and checks
     all_keys = set()
     for data in datasets:
         all_keys.update(data.keys())
+    all_checks = set().union(*file_checks)
 
     differences = []
     per_check_stats = defaultdict(lambda: Counter())
     checkid_to_title = {}
 
     # Compare across files
-    for key in all_keys:  # maintain natural order (first file order)
+    for key in all_keys:
         resource_uid, check_id = key
         statuses, muted_flags = [], []
         check_title, resource_name = "", ""
@@ -88,12 +107,17 @@ def main():
                 muted_flags.append(False)
 
         flags = []
-        if len(set(statuses)) > 1:
+        unique_statuses = {s for s in statuses if s != "MISSING"}
+        if all(s != "MISSING" for s in statuses) and len(unique_statuses) > 1:
             flags.append("DIFFERENT")
-            per_check_stats[check_id]["mismatches"] += 1
-        if any(s == "MISSING" for s in statuses):
-            flags.append("MISSING")
-            per_check_stats[check_id]["missing"] += 1
+            per_check_stats[check_id]["different"] += 1
+        elif any(s == "MISSING" for s in statuses):
+            if len(unique_statuses) == 1:
+                flags.append("MISSING BUT SAME")
+                per_check_stats[check_id]["missing_same"] += 1
+            elif len(unique_statuses) > 1:
+                flags.append("MISSING BUT DIFFERENT")
+                per_check_stats[check_id]["missing_diff"] += 1
         if any(muted_flags):
             flags.append("MUTED")
             per_check_stats[check_id]["muted"] += 1
@@ -109,27 +133,30 @@ def main():
             })
             checkid_to_title[check_id] = check_title
 
-    # Count totals
-    total_mismatches = sum(v["mismatches"] for v in per_check_stats.values())
-    total_missing = sum(v["missing"] for v in per_check_stats.values())
+    # Totals
+    total_different = sum(v["different"] for v in per_check_stats.values())
+    total_missing_same = sum(v["missing_same"] for v in per_check_stats.values())
+    total_missing_diff = sum(v["missing_diff"] for v in per_check_stats.values())
     total_muted = sum(v["muted"] for v in per_check_stats.values())
     controls_with_diffs = len(per_check_stats)
-    unique_controls = len({cid for _, cid in all_keys})
+    unique_controls = len(all_checks)
 
     # ===== Write Report ===== #
     with open(OUTPUT_FILE, "w", encoding="utf-8") as out:
         # --- Summary ---
         out.write("===== SUMMARY =====\n")
+        out.write("--- File Statistics ---\n")
         for fname, totals in zip(file_labels, file_totals):
             out.write(
                 f"{fname} → PASS: {totals['PASS']}, FAIL: {totals['FAIL']}, "
                 f"WARN: {totals['WARN']}, MUTED: {totals['MUTED']}, TOTAL: {totals['TOTAL']}\n"
             )
-        out.write("\n")
+        out.write("\n--- Differences Statistics ---\n")
         out.write(
-            f"Total mismatches (resources with status differences): {total_mismatches}\n"
-            f"Total missing resources: {total_missing}\n"
-            f"Total muted findings: {total_muted}\n"
+            f"Different (all present, statuses differ): {total_different}\n"
+            f"Missing but same: {total_missing_same}\n"
+            f"Missing but different: {total_missing_diff}\n"
+            f"Muted findings: {total_muted}\n"
             f"Controls with differences: {controls_with_diffs}\n"
             f"Unique controls in all files: {unique_controls}\n\n"
         )
@@ -154,26 +181,47 @@ def main():
         out.write("===== PER-CHECK DIFFERENCES =====\n")
         for check_id, stats in per_check_stats.items():
             parts = []
-            if stats["mismatches"]:
-                parts.append(f"{stats['mismatches']} mismatches")
-            if stats["missing"]:
-                parts.append(f"{stats['missing']} missing")
+            if stats["different"]:
+                parts.append(f"{stats['different']} different")
+            if stats["missing_same"]:
+                parts.append(f"{stats['missing_same']} missing but same")
+            if stats["missing_diff"]:
+                parts.append(f"{stats['missing_diff']} missing but different")
             if stats["muted"]:
                 parts.append(f"{stats['muted']} muted")
             if parts:
                 out.write(f"{check_id} → {', '.join(parts)}\n")
 
+        # --- Checks Coverage ---
+        out.write("\n===== CHECKS COVERAGE =====\n")
+        for fname, checks in zip(file_labels, file_checks):
+            missing = all_checks - checks
+            if missing:
+                out.write(f"{fname} is missing {len(missing)} checks: {', '.join(sorted(missing))}\n")
+            else:
+                out.write(f"{fname} → All {len(all_checks)} checks present\n")
+
+        # --- Data Quality Issues ---
+        out.write("\n===== DATA QUALITY ISSUES =====\n")
+        if file_issues:
+            for issue in file_issues:
+                out.write(issue + "\n")
+        else:
+            out.write("No data quality issues found\n")
+
         # --- Overall Totals ---
         out.write("\n===== OVERALL TOTALS =====\n")
         out.write(
-            f"Total mismatches: {total_mismatches}\n"
-            f"Total missing resources: {total_missing}\n"
-            f"Total muted findings: {total_muted}\n"
+            f"Different (all present, statuses differ): {total_different}\n"
+            f"Missing but same: {total_missing_same}\n"
+            f"Missing but different: {total_missing_diff}\n"
+            f"Muted findings: {total_muted}\n"
             f"Controls with differences: {controls_with_diffs}\n"
             f"Unique controls in all files: {unique_controls}\n"
         )
 
     print(f"Comparison report written to {OUTPUT_FILE}")
+
 
 if __name__ == "__main__":
     main()
