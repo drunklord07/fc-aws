@@ -1,0 +1,213 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import os
+import csv
+from collections import defaultdict, Counter
+
+# ========= CONFIGURATION ========= #
+INPUT_FOLDER = "prowler_outputs"      # Folder containing all CSVs
+BASELINE_FILE = "baseline.csv"        # Name of baseline CSV inside the folder
+OUTPUT_FILE = "baseline_comparison_report.txt"
+# ================================= #
+
+
+def load_csv(filepath):
+    """Load Prowler CSV into dict keyed by (resource_uid, check_id)."""
+    data = {}
+    checks = set()
+    with open(filepath, newline='', encoding="utf-8") as f:
+        reader = csv.DictReader(f, delimiter=';')
+        for row in reader:
+            check_id = row.get("CHECK_ID", "").strip()
+            check_title = row.get("CHECK_TITLE", "").strip()
+            resource_uid = row.get("RESOURCE_UID", "").strip()
+            resource_name = row.get("RESOURCE_NAME", "").strip()
+            status = row.get("STATUS", "").strip().upper()
+            muted = row.get("MUTED", "").strip().upper()
+
+            if not check_id or not resource_uid:
+                continue
+
+            key = (resource_uid, check_id)
+            data[key] = {
+                "check_id": check_id,
+                "check_title": check_title,
+                "resource_uid": resource_uid,
+                "resource_name": resource_name,
+                "status": status,
+                "muted": muted == "TRUE" or status == "MUTED",
+            }
+            checks.add(check_id)
+    return data, checks
+
+
+def main():
+    # Collect all files
+    files = [os.path.join(INPUT_FOLDER, f) for f in os.listdir(INPUT_FOLDER) if f.endswith(".csv")]
+    files.sort()
+
+    baseline_path = os.path.join(INPUT_FOLDER, BASELINE_FILE)
+    if not os.path.exists(baseline_path):
+        raise RuntimeError(f"Baseline file {BASELINE_FILE} not found in {INPUT_FOLDER}")
+
+    # Separate baseline and others
+    comparison_files = [f for f in files if os.path.basename(f) != BASELINE_FILE]
+    baseline_data, baseline_checks = load_csv(baseline_path)
+    comparison_datasets, comparison_checks = [], []
+    for f in comparison_files:
+        data, checks = load_csv(f)
+        comparison_datasets.append((os.path.basename(f), data))
+        comparison_checks.append(checks)
+
+    # All unique checks
+    all_checks = set(baseline_checks)
+    for checks in comparison_checks:
+        all_checks.update(checks)
+
+    # ===== SUMMARY STATS =====
+    baseline_missing_checks = all_checks - baseline_checks
+    baseline_extra_checks = baseline_checks - set().union(*comparison_checks)
+
+    differences = []
+    per_check_stats = defaultdict(lambda: Counter())
+    checkid_to_title = {}
+
+    # Drift comparison: Baseline → Others
+    for key in baseline_data.keys():
+        resource_uid, check_id = key
+        baseline_entry = baseline_data[key]
+        statuses = [baseline_entry["status"]]
+        muted_flags = [baseline_entry["muted"]]
+        check_title = baseline_entry["check_title"]
+        resource_name = baseline_entry["resource_name"]
+
+        for fname, data in comparison_datasets:
+            entry = data.get(key)
+            if entry:
+                statuses.append(entry["status"])
+                muted_flags.append(entry["muted"])
+            else:
+                statuses.append("MISSING")
+                muted_flags.append(False)
+
+        flags = []
+        unique_statuses = {s for s in statuses if s != "MISSING"}
+        if len(unique_statuses) > 1:
+            flags.append("DIFFERENT")
+            per_check_stats[check_id]["different"] += 1
+        if any(s == "MISSING" for s in statuses[1:]):  # exclude baseline
+            flags.append("MISSING")
+            per_check_stats[check_id]["missing"] += 1
+        if any(muted_flags):
+            flags.append("MUTED")
+            per_check_stats[check_id]["muted"] += 1
+
+        if flags:
+            differences.append({
+                "check_id": check_id,
+                "check_title": check_title,
+                "resource_uid": resource_uid,
+                "resource_name": resource_name,
+                "statuses": statuses,
+                "flags": flags
+            })
+            checkid_to_title[check_id] = check_title
+
+    # Completeness check: Others → Baseline
+    baseline_completeness = []
+    for fname, data in comparison_datasets:
+        for key, entry in data.items():
+            if key not in baseline_data:
+                baseline_completeness.append({
+                    "check_id": entry["check_id"],
+                    "check_title": entry["check_title"],
+                    "resource_uid": entry["resource_uid"],
+                    "resource_name": entry["resource_name"],
+                    "present_in": fname
+                })
+
+    # Totals
+    total_different = sum(v["different"] for v in per_check_stats.values())
+    total_missing = sum(v["missing"] for v in per_check_stats.values())
+    total_muted = sum(v["muted"] for v in per_check_stats.values())
+    controls_with_diffs = len(per_check_stats)
+
+    # ===== WRITE REPORT =====
+    with open(OUTPUT_FILE, "w", encoding="utf-8") as out:
+        # --- Summary ---
+        out.write("===== BASELINE COMPARISON SUMMARY =====\n")
+        out.write(f"Baseline: {BASELINE_FILE}\n")
+        out.write(f"Other files compared: {', '.join(os.path.basename(f) for f in comparison_files)}\n\n")
+        out.write(f"Total checks in baseline: {len(baseline_checks)}\n")
+        out.write(f"Total checks across all files: {len(all_checks)}\n\n")
+
+        if baseline_missing_checks:
+            out.write(f"Baseline is missing {len(baseline_missing_checks)} checks:\n")
+            for cid in sorted(baseline_missing_checks):
+                out.write(f"- {cid}\n")
+            out.write("\n")
+        if baseline_extra_checks:
+            out.write(f"Baseline has {len(baseline_extra_checks)} checks not found in others:\n")
+            for cid in sorted(baseline_extra_checks):
+                out.write(f"- {cid}\n")
+            out.write("\n")
+
+        out.write("Drift relative to baseline:\n")
+        out.write(f"- Different: {total_different}\n")
+        out.write(f"- Missing (in others): {total_missing}\n")
+        out.write(f"- Muted: {total_muted}\n")
+        out.write(f"Controls with differences: {controls_with_diffs}\n\n")
+
+        # --- Baseline → Others Drift ---
+        out.write("===== BASELINE → OTHERS COMPARISON =====\n")
+        seen_controls = set()
+        for diff in differences:
+            cid = diff["check_id"]
+            if cid not in seen_controls:
+                seen_controls.add(cid)
+                out.write(f"\nCONTROL: {cid.upper()}\n")
+                out.write(f"Title: {diff['check_title']}\n\n")
+
+            out.write(f"ResourceUID: {diff['resource_uid']}\n")
+            out.write(f"ResourceName: {diff['resource_name']}\n")
+            out.write(f"{BASELINE_FILE}: {diff['statuses'][0]}\n")
+            for (fname, _), status in zip(comparison_datasets, diff["statuses"][1:]):
+                out.write(f"{fname}: {status}\n")
+            out.write(f"→ Flags: {', '.join(diff['flags'])}\n\n")
+
+        # --- Baseline Completeness ---
+        out.write("===== BASELINE COMPLETENESS CHECK =====\n")
+        if baseline_completeness:
+            grouped = defaultdict(list)
+            for entry in baseline_completeness:
+                grouped[entry["check_id"]].append(entry)
+            for cid, entries in grouped.items():
+                out.write(f"\nCONTROL: {cid.upper()}\n")
+                out.write(f"Title: {entries[0]['check_title']}\n\n")
+                for e in entries:
+                    out.write(f"ResourceUID: {e['resource_uid']}\n")
+                    out.write(f"ResourceName: {e['resource_name']}\n")
+                    out.write(f"Present in: {e['present_in']}\n")
+                    out.write(f"Missing in: {BASELINE_FILE}\n\n")
+        else:
+            out.write("No extra resources found in others compared to baseline.\n\n")
+
+        # --- Per-Check Summary ---
+        out.write("===== PER-CHECK DIFFERENCES =====\n")
+        for check_id, stats in per_check_stats.items():
+            parts = []
+            if stats["different"]:
+                parts.append(f"{stats['different']} different")
+            if stats["missing"]:
+                parts.append(f"{stats['missing']} missing")
+            if stats["muted"]:
+                parts.append(f"{stats['muted']} muted")
+            if parts:
+                out.write(f"{check_id} → {', '.join(parts)}\n")
+
+    print(f"Baseline comparison report written to {OUTPUT_FILE}")
+
+
+if __name__ == "__main__":
+    main()
