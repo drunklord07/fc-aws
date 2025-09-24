@@ -37,11 +37,18 @@ def create_observations_sheet_report():
             'REMEDIATION_RECOMMENDATION_CODE_TERRAFORM', 'REMEDIATION_RECOMMENDATION_CODE_CLI', 
             'REMEDIATION_RECOMMENDATION_CODE_OTHER', 'COMPLIANCE', 'CATEGORIES', 'DEPENDS_ON', 
             'RELATED_TO', 'NOTES', 'PROFILE', 'ACCOUNT_ID', 'ACCOUNT_NAME', 'ACCOUNT_EMAIL', 
-            'ACCOUNT_ARN', 'ACCOUNT_ORG', 'ACCOUNT_TAGS', 'RESOURCE_ID'
+            'ACCOUNT_ARN', 'ACCOUNT_ORG', 'ACCOUNT_TAGS'
         ]
         
         print("3. Deleting specified columns from the DataFrame.")
         df.drop(columns=[c for c in columns_to_delete if c in df.columns], inplace=True)
+
+        # Handle variations in resource column naming
+        if 'RESOURCE_ARN' not in df.columns:
+            for alt_col in ['RESOURCE_UID', 'RESOURCE_ID']:
+                if alt_col in df.columns:
+                    df.rename(columns={alt_col: 'RESOURCE_ARN'}, inplace=True)
+                    break
 
         # Normalize severity
         severity_order = ['Critical', 'High', 'Medium', 'Low']
