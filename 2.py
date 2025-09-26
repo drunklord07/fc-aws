@@ -33,12 +33,16 @@ from botocore.exceptions import ClientError, BotoCoreError
 
 JsonDict = Dict[str, Any]
 
+
 # ---------------------------
 # Utility functions
 # ---------------------------
 
 def decode_policy_document(maybe_encoded: Union[str, Dict[str, Any]]) -> Dict[str, Any]:
-    """Accept dict JSON or (possibly URL-encoded) JSON string; return dict."""
+    """
+    Accept either a dict (already JSON) or a string that might be URL-encoded JSON.
+    Return a Python dict representing the policy document.
+    """
     if isinstance(maybe_encoded, dict):
         return maybe_encoded
 
@@ -69,8 +73,8 @@ def ensure_list(x: Any) -> List[Any]:
 
 def extract_service_prefix(action: str) -> Optional[str]:
     """
-    If action is like 'service:*', return 'service' (lowercased).
-    Otherwise return None. Treat '*' and '*:*' as None (handled elsewhere).
+    If action is like 'service:*', return 'service' (case-insensitive).
+    Otherwise return None.
     """
     if not isinstance(action, str):
         return None
@@ -86,11 +90,6 @@ def analyze_policy_document(doc: Dict[str, Any]) -> Tuple[bool, List[str]]:
     """
     Analyze a policy document and return:
       (full_admin: bool, service_wide_on_all_resources: List[str])
-
-    Notes:
-      - If Resource is omitted, treat as "*".
-      - We only consider 'Action' for both signals; 'NotAction' is ignored for "full admin"
-        and service-wide flags (because it represents exceptions, not grants).
     """
     stmts = ensure_list(doc.get("Statement"))
     full_admin = False
@@ -103,8 +102,12 @@ def analyze_policy_document(doc: Dict[str, Any]) -> Tuple[bool, List[str]]:
             continue
 
         actions = [a for a in ensure_list(st.get("Action")) if isinstance(a, str)]
+
         # Treat missing Resource as "*"
-        resources = [r for r in ensure_list(st.get("Resource") if "Resource" in st else "*") if isinstance(r, str)]
+        if "Resource" in st:
+            resources = [r for r in ensure_list(st.get("Resource")) if isinstance(r, str)]
+        else:
+            resources = ["*"]
 
         action_wild = any(a == "*" or a == "*:*" for a in actions)
         resource_all = any(r == "*" for r in resources)
@@ -130,7 +133,9 @@ def paginate(client, op_name: str, result_key: str, **kwargs):
 
 
 def list_entities_for_policy(iam, policy_arn: str) -> Tuple[List[str], List[str], List[str]]:
-    """Return (users[], groups[], roles[]) that have the managed policy attached."""
+    """
+    Return (users[], groups[], roles[]) that have the managed policy attached.
+    """
     users: List[str] = []
     groups: List[str] = []
     roles: List[str] = []
@@ -150,6 +155,7 @@ def safe_get_policy_version(iam, arn: str, version_id: str) -> Dict[str, Any]:
     doc_raw = resp["PolicyVersion"]["Document"]
     return decode_policy_document(doc_raw)
 
+
 # ---------------------------
 # Scanners
 # ---------------------------
@@ -162,18 +168,12 @@ def scan_managed_policies(
 ) -> List[Dict[str, Any]]:
     """
     Scan managed policies based on filters; analyze and return structured results.
-
-    Important behavior:
-    - We DO NOT set PolicyUsageFilter, because doing so would suppress unattached
-      policies even if --include-unattached is set.
-    - To exclude policies used *solely* as permissions boundaries while keeping
-      unattached normal policies if requested, we post-filter on the returned items.
     """
     list_kwargs = {
         "Scope": "All" if include_aws_managed else "Local",
         "OnlyAttached": not include_unattached,
     }
-    # Do NOT set PolicyUsageFilter here; we post-filter using counts.
+    # NOTE: We intentionally do not set PolicyUsageFilter here.
 
     results: List[Dict[str, Any]] = []
 
@@ -185,9 +185,7 @@ def scan_managed_policies(
         is_attachable = pol.get("IsAttachable", True)
         pb_count = pol.get("PermissionsBoundaryUsageCount", 0)
 
-        # Post-filter for boundaries-only if required:
-        # If we included unattached and did NOT include boundaries, then skip those
-        # that are used only as permissions boundaries.
+        # Exclude policies used solely as permissions boundaries if requested
         if include_unattached and not include_boundaries:
             if attachment_count == 0 and pb_count > 0:
                 continue
@@ -207,7 +205,10 @@ def scan_managed_policies(
             users, groups, roles = list_entities_for_policy(iam, arn)
         except (ClientError, BotoCoreError) as e:
             users, groups, roles = [], [], []
-            analysis_error = f"{analysis_error} | list_entities_for_policy: {e}" if analysis_error else f"list_entities_for_policy: {e}"
+            analysis_error = (
+                f"{analysis_error} | list_entities_for_policy: {e}"
+                if analysis_error else f"list_entities_for_policy: {e}"
+            )
 
         results.append({
             "Type": "Managed",
@@ -324,6 +325,7 @@ def scan_inline_policies(iam) -> List[Dict[str, Any]]:
 
     return flagged
 
+
 # ---------------------------
 # Output writers
 # ---------------------------
@@ -391,6 +393,7 @@ def write_csv_inline(path: str, records: List[Dict[str, Any]]) -> None:
                 ";".join(r.get("ServiceWideOnAllResources", [])),
                 r.get("AnalysisError") or ""
             ])
+
 
 # ---------------------------
 # Main / CLI
@@ -470,6 +473,7 @@ def main():
     print(f"- CSV (managed): {args.out_csv}")
     if args.include_inline:
         print(f"- CSV (inline flagged): {args.out_inline_csv}")
+
 
 if __name__ == "__main__":
     try:
