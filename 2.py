@@ -2,27 +2,26 @@
 # -*- coding: utf-8 -*-
 
 """
-IAM policy scope analyzer — from scratch (clean indentation, no emoji).
+IAM policy scope analyzer (clean, from scratch).
 
-Default behavior:
+Default:
 - Customer-managed only (Scope="Local")
 - Only attached policies
-- Excludes policies used solely as permissions boundaries
-- Flags:
-  * Full admin: Allow + Action "*" or "*:*" + Resource "*"
-  * Service-wide admin on all resources: e.g., "s3:*" on "*"
-- Reports where each managed policy is attached (users/groups/roles)
-- Optional: include inline identity policies (users, roles, groups)
+- Excludes policies used solely as permissions boundaries when including unattached (unless opted in)
+Flags reported:
+- Full admin (Allow + Action "*" or "*:*" + Resource "*")
+- Service-wide admin on all resources (e.g., "s3:*" on "*")
+- Broad via NotAction on all resources (Allow + NotAction + Resource "*")
 
 Outputs:
-- JSON report (detailed)
-- CSV report (managed summary)
+- JSON: detailed results + summary
+- CSV: managed policies summary
+- CSV (inline): flagged inline policies (only with --include-inline)
 """
 
 import argparse
 import csv
 import json
-import sys
 import time
 import urllib.parse
 from typing import Any, Dict, List, Optional, Tuple, Union, Set
@@ -31,53 +30,36 @@ import boto3
 from botocore.config import Config
 from botocore.exceptions import ClientError, BotoCoreError
 
-
 JsonDict = Dict[str, Any]
 
 
-# ---------------------------
-# Helpers
-# ---------------------------
+# ---------- Helpers ----------
 
-def _ensure_list(x: Any) -> List[Any]:
-    if x is None:
-        return []
-    return x if isinstance(x, list) else [x]
+def ensure_list(x: Any) -> List[Any]:
+    return [] if x is None else (x if isinstance(x, list) else [x])
 
 
-def _decode_policy_document(maybe_encoded: Union[str, Dict[str, Any]]) -> Dict[str, Any]:
-    """
-    Accept dict JSON or (possibly URL-encoded) JSON string; return dict.
-    """
+def decode_policy_document(maybe_encoded: Union[str, Dict[str, Any]]) -> Dict[str, Any]:
     if isinstance(maybe_encoded, dict):
         return maybe_encoded
-
     s = (maybe_encoded or "").strip()
     if not s:
         return {}
-
-    # Try raw JSON first
     try:
         return json.loads(s)
     except Exception:
         pass
-
-    # Fallback: URL-decoded JSON
     try:
-        decoded = urllib.parse.unquote(s)
-        return json.loads(decoded)
+        return json.loads(urllib.parse.unquote(s))
     except Exception as e:
-        raise ValueError("Unable to parse policy document: %s" % e) from e
+        raise ValueError("Unable to parse policy document: %s" % e)
 
 
-def _extract_service_prefix(action: str) -> Optional[str]:
-    """
-    If action is like 'service:*', return 'service' (lowercased). Else None.
-    """
+def extract_service_prefix(action: str) -> Optional[str]:
     if not isinstance(action, str):
         return None
     a = action.lower()
-    if a == "*" or a == "*:*":
+    if a in ("*", "*:*"):
         return None
     if a.endswith(":*") and ":" in a:
         return a.split(":", 1)[0]
@@ -86,20 +68,14 @@ def _extract_service_prefix(action: str) -> Optional[str]:
 
 def analyze_policy_document(doc: Dict[str, Any]) -> Tuple[bool, List[str], bool, List[str]]:
     """
-    Analyze a policy document and return:
-      - full_admin: bool
-      - service_wide_on_all_resources: List[str] of services with 'service:*' on Resource "*"
-      - broad_by_notaction: bool  (Allow + NotAction + Resource "*")
-      - notaction_services: List[str]  (best-effort service tokens inside NotAction)
-    Notes:
-      - If Resource is omitted, treat as "*".
-      - We ignore NotAction for "full admin" calculation, but surface it separately.
+    Returns:
+      full_admin, service_wide_services, broad_by_notaction, notaction_services
     """
-    stmts = _ensure_list(doc.get("Statement"))
+    stmts = ensure_list(doc.get("Statement"))
     full_admin = False
     svc_wide: Set[str] = set()
-    broad_notaction = False
-    notaction_svcs: Set[str] = set()
+    broad_na = False
+    na_svcs: Set[str] = set()
 
     for st in stmts:
         if not isinstance(st, dict):
@@ -107,37 +83,30 @@ def analyze_policy_document(doc: Dict[str, Any]) -> Tuple[bool, List[str], bool,
         if st.get("Effect") != "Allow":
             continue
 
-        actions = [a for a in _ensure_list(st.get("Action")) if isinstance(a, str)]
-        not_actions = [a for a in _ensure_list(st.get("NotAction")) if isinstance(a, str)]
+        actions = [a for a in ensure_list(st.get("Action")) if isinstance(a, str)]
+        not_actions = [a for a in ensure_list(st.get("NotAction")) if isinstance(a, str)]
 
         # Treat missing Resource as "*"
-        if "Resource" in st:
-            resources = [r for r in _ensure_list(st.get("Resource")) if isinstance(r, str)]
-        else:
-            resources = ["*"]
+        res_list = ensure_list(st.get("Resource")) if "Resource" in st else ["*"]
+        resource_all = any(r == "*" for r in res_list)
 
-        resource_all = any(r == "*" for r in resources)
-
-        # Full admin: Action wildcard + Resource "*"
         if resource_all and any(a in ("*", "*:*") for a in actions):
             full_admin = True
 
-        # Service-wide: e.g., "s3:*" with Resource "*"
         if resource_all:
             for a in actions:
-                svc = _extract_service_prefix(a)
+                svc = extract_service_prefix(a)
                 if svc:
                     svc_wide.add(svc)
 
-        # Broad by NotAction (Allow + NotAction + Resource "*")
         if resource_all and not_actions:
-            broad_notaction = True
+            broad_na = True
             for a in not_actions:
-                svc = _extract_service_prefix(a)
+                svc = extract_service_prefix(a)
                 if svc:
-                    notaction_svcs.add(svc)
+                    na_svcs.add(svc)
 
-    return full_admin, sorted(svc_wide), broad_notaction, sorted(notaction_svcs)
+    return full_admin, sorted(svc_wide), broad_na, sorted(na_svcs)
 
 
 def paginate(client, op_name: str, result_key: str, **kwargs):
@@ -163,13 +132,10 @@ def list_entities_for_policy(iam, policy_arn: str) -> Tuple[List[str], List[str]
 
 def get_policy_default_doc(iam, arn: str, version_id: str) -> Dict[str, Any]:
     resp = iam.get_policy_version(PolicyArn=arn, VersionId=version_id)
-    raw = resp["PolicyVersion"]["Document"]
-    return _decode_policy_document(raw)
+    return decode_policy_document(resp["PolicyVersion"]["Document"])
 
 
-# ---------------------------
-# Scanners
-# ---------------------------
+# ---------- Scanners ----------
 
 def scan_managed_policies(
     iam,
@@ -177,15 +143,6 @@ def scan_managed_policies(
     include_unattached: bool,
     include_boundaries: bool,
 ) -> List[Dict[str, Any]]:
-    """
-    Scan managed policies based on filters; analyze and return structured results.
-    - Scope: Local (default) or All if include_aws_managed
-    - OnlyAttached: True unless include_unattached
-    - We do NOT set PolicyUsageFilter to avoid suppressing unattached.
-      Instead, if include_unattached and not include_boundaries, we skip
-      policies where AttachmentCount==0 and PermissionsBoundaryUsageCount>0
-      (i.e., used solely as permissions boundaries).
-    """
     list_kwargs = {
         "Scope": "All" if include_aws_managed else "Local",
         "OnlyAttached": not include_unattached,
@@ -201,14 +158,12 @@ def scan_managed_policies(
         pb_count = pol.get("PermissionsBoundaryUsageCount", 0)
         is_attachable = pol.get("IsAttachable", True)
 
+        # Skip boundary-only policies when including unattached, unless opted in.
         if include_unattached and not include_boundaries:
             if attachment_count == 0 and pb_count > 0:
-                # skip boundary-only policies when requesting unattached set
                 continue
 
         analysis_error: Optional[str] = None
-
-        # Fetch policy document
         try:
             doc = get_policy_default_doc(iam, arn, default_version_id)
         except (ClientError, BotoCoreError, ValueError) as e:
@@ -217,13 +172,12 @@ def scan_managed_policies(
 
         fa, svc_wide, broad_na, na_svcs = analyze_policy_document(doc) if doc else (False, [], False, [])
 
-        # Attachment details
         try:
             users, groups, roles = list_entities_for_policy(iam, arn)
         except (ClientError, BotoCoreError) as e:
             users, groups, roles = [], [], []
             msg = "list_entities_for_policy error: %s" % e
-            analysis_error = ("%s | %s" % (analysis_error, msg)) if analysis_error else msg
+            analysis_error = (analysis_error + " | " + msg) if analysis_error else msg
 
         results.append({
             "Type": "Managed",
@@ -247,10 +201,6 @@ def scan_managed_policies(
 
 
 def scan_inline_policies(iam) -> List[Dict[str, Any]]:
-    """
-    Scan inline identity policies (users, roles, groups).
-    Return only those flagged as broad (full admin or service-wide or broad by NotAction).
-    """
     flagged: List[Dict[str, Any]] = []
 
     # Users
@@ -259,7 +209,7 @@ def scan_inline_policies(iam) -> List[Dict[str, Any]]:
         for pn in paginate(iam, "list_user_policies", "PolicyNames", UserName=uname):
             try:
                 up = iam.get_user_policy(UserName=uname, PolicyName=pn)
-                doc = _decode_policy_document(up["PolicyDocument"])
+                doc = decode_policy_document(up["PolicyDocument"])
                 fa, svc_wide, broad_na, na_svcs = analyze_policy_document(doc)
                 if fa or svc_wide or broad_na:
                     flagged.append({
@@ -292,7 +242,7 @@ def scan_inline_policies(iam) -> List[Dict[str, Any]]:
         for pn in paginate(iam, "list_role_policies", "PolicyNames", RoleName=rname):
             try:
                 rp = iam.get_role_policy(RoleName=rname, PolicyName=pn)
-                doc = _decode_policy_document(rp["PolicyDocument"])
+                doc = decode_policy_document(rp["PolicyDocument"])
                 fa, svc_wide, broad_na, na_svcs = analyze_policy_document(doc)
                 if fa or svc_wide or broad_na:
                     flagged.append({
@@ -325,7 +275,7 @@ def scan_inline_policies(iam) -> List[Dict[str, Any]]:
         for pn in paginate(iam, "list_group_policies", "PolicyNames", GroupName=gname):
             try:
                 gp = iam.get_group_policy(GroupName=gname, PolicyName=pn)
-                doc = _decode_policy_document(gp["PolicyDocument"])
+                doc = decode_policy_document(gp["PolicyDocument"])
                 fa, svc_wide, broad_na, na_svcs = analyze_policy_document(doc)
                 if fa or svc_wide or broad_na:
                     flagged.append({
@@ -355,9 +305,7 @@ def scan_inline_policies(iam) -> List[Dict[str, Any]]:
     return flagged
 
 
-# ---------------------------
-# Output
-# ---------------------------
+# ---------- Output ----------
 
 def write_json(path: str, data: Any) -> None:
     with open(path, "w", encoding="utf-8") as f:
@@ -432,32 +380,20 @@ def write_csv_inline(path: str, records: List[Dict[str, Any]]) -> None:
             ])
 
 
-# ---------------------------
-# CLI
-# ---------------------------
+# ---------- CLI ----------
 
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Analyze IAM policies for overly broad access."
-    )
+    parser = argparse.ArgumentParser(description="Analyze IAM policies for overly broad access.")
     parser.add_argument("--profile", help="AWS profile name (optional)")
     parser.add_argument("--region", help="AWS region for client (IAM is global; optional)", default=None)
-
-    parser.add_argument("--include-aws-managed", action="store_true",
-                        help="Include AWS-managed policies in addition to customer-managed")
-    parser.add_argument("--include-unattached", action="store_true",
-                        help="Include unattached managed policies")
-    parser.add_argument("--include-boundaries", action="store_true",
-                        help="Include policies used as permissions boundaries")
-
-    parser.add_argument("--include-inline", action="store_true",
-                        help="Scan inline identity policies (users/roles/groups)")
-
-    parser.add_argument("--out-json", default="iam_policy_scope.json", help="Output JSON file")
-    parser.add_argument("--out-csv", default="iam_policy_scope.csv", help="Output CSV for managed policies")
+    parser.add_argument("--include-aws-managed", action="store_true", help="Include AWS-managed policies")
+    parser.add_argument("--include-unattached", action="store_true", help="Include unattached managed policies")
+    parser.add_argument("--include-boundaries", action="store_true", help="Include boundary-only policies")
+    parser.add_argument("--include-inline", action="store_true", help="Scan inline identity policies")
+    parser.add_argument("--out-json", default="iam_policy_scope.json", help="Output JSON path")
+    parser.add_argument("--out-csv", default="iam_policy_scope.csv", help="Output CSV (managed) path")
     parser.add_argument("--out-inline-csv", default="iam_inline_scope.csv",
-                        help="Output CSV for flagged inline policies (only if --include-inline)")
-
+                        help="Output CSV (inline flagged) path")
     args = parser.parse_args()
 
     session_kwargs: Dict[str, Any] = {}
@@ -467,8 +403,6 @@ def main() -> None:
 
     config = Config(retries={"max_attempts": 10, "mode": "standard"})
     iam = session.client("iam", region_name=args.region, config=config)
-
-    started = time.time()
 
     managed = scan_managed_policies(
         iam=iam,
@@ -499,8 +433,7 @@ def main() -> None:
     if args.include_inline:
         write_csv_inline(args.out_inline_csv, inline_flagged)
 
-    elapsed = time.time() - started
-    print("Done in %.1fs" % elapsed)
+    print("Done.")
     print("- JSON:", args.out_json)
     print("- CSV (managed):", args.out_csv)
     if args.include_inline:
@@ -508,7 +441,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except KeyboardInterrupt:
-        sys.exit(130)
+    main()
