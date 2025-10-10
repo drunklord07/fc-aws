@@ -1,46 +1,48 @@
 #!/usr/bin/env bash
-# Minimal EC2 public-subnet audit (IPv4). Uses env creds:
-# AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY [/ AWS_SESSION_TOKEN]
-# Output columns: region,instance_id,subnet_id,route_table_id,status
+# Simple AWS EC2 public subnet audit using the default profile.
+# Output: region,instance_id,subnet_id,route_table_id,status
 
 set -euo pipefail
 
-# Make CLI output predictable
-unset AWS_PROFILE AWS_DEFAULT_REGION
+PROFILE="default"
 export AWS_PAGER=""
 
-# Quick sanity: must be able to call STS
-aws sts get-caller-identity >/dev/null
+# Verify that the default profile exists
+aws configure list-profiles | grep -qx "$PROFILE" || {
+  echo "ERROR: AWS profile '$PROFILE' not found." >&2
+  exit 1
+}
 
 echo "region,instance_id,subnet_id,route_table_id,status"
 
-# All regions
-for REGION in $(aws ec2 describe-regions \
-                 --query 'Regions[].RegionName' --output text); do
+# List all AWS regions
+for REGION in $(aws ec2 describe-regions --profile "$PROFILE" \
+               --query 'Regions[].RegionName' --output text); do
 
-  # InstanceId SubnetId VpcId (only running)
-  aws ec2 describe-instances --region "$REGION" \
+  # List instance ID, Subnet ID, VPC ID (only running)
+  aws ec2 describe-instances --region "$REGION" --profile "$PROFILE" \
     --query 'Reservations[].Instances[?State.Name==`running`].[InstanceId,SubnetId,VpcId]' \
     --output text \
   | while read -r INSTANCE_ID SUBNET_ID VPC_ID; do
-      # Route table explicitly associated to subnet
-      RTB_ID=$(aws ec2 describe-route-tables --region "$REGION" \
+      # Get the route table associated with this subnet
+      RTB_ID=$(aws ec2 describe-route-tables --region "$REGION" --profile "$PROFILE" \
                --filters "Name=association.subnet-id,Values=$SUBNET_ID" \
                --query 'RouteTables[0].RouteTableId' --output text 2>/dev/null || true)
 
-      # Fallback to VPC main route table if none
+      # Fallback: if subnet has no specific route table, use the VPC's main one
       if [ -z "${RTB_ID:-}" ] || [ "$RTB_ID" = "None" ]; then
-        RTB_ID=$(aws ec2 describe-route-tables --region "$REGION" \
+        RTB_ID=$(aws ec2 describe-route-tables --region "$REGION" --profile "$PROFILE" \
                  --filters "Name=vpc-id,Values=$VPC_ID" "Name=association.main,Values=true" \
                  --query 'RouteTables[0].RouteTableId' --output text 2>/dev/null || true)
       fi
 
-      # Public subnet if default IPv4 route to an Internet Gateway
-      IGW=$(aws ec2 describe-route-tables --region "$REGION" \
+      # Check if route table has a default route (0.0.0.0/0) to an Internet Gateway
+      IGW=$(aws ec2 describe-route-tables --region "$REGION" --profile "$PROFILE" \
             --route-table-ids "${RTB_ID:-}" \
             --query "RouteTables[].Routes[?DestinationCidrBlock=='0.0.0.0/0' && contains(GatewayId, 'igw-')]" \
             --output text 2>/dev/null || true)
 
+      # Determine compliance status
       if [ -z "${RTB_ID:-}" ] || [ "$RTB_ID" = "None" ]; then
         STATUS="UNKNOWN"
       elif [ -n "$IGW" ]; then
