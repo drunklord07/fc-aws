@@ -1,122 +1,97 @@
 #!/bin/bash
-set -euo pipefail
 
-# ====================== Metadata ======================
+# Description and Criteria
 description="AWS Audit for Backend EC2 Instance Public Subnet Exposure"
-criteria="Checks if EC2 instances are in public subnets by examining the effective route table (subnet-associated or VPC main). Presence of a 0.0.0.0/0 or ::/0 route to an Internet Gateway (igw-*) => Public Subnet => Non-Compliant."
+criteria="This script checks if backend EC2 instances are running in a public subnet by verifying the associated VPC route tables.
+Instances using public subnets are marked as 'Non-Compliant'."
 
+# Command being used
 command_used="Commands Used:
   1. aws ec2 describe-regions --query 'Regions[*].RegionName' --output text
-  2. aws ec2 describe-instances --region \$REGION --query 'Reservations[].Instances[][InstanceId,SubnetId,VpcId,State.Name]' --output text
-  3. aws ec2 describe-route-tables --filters Name=association.subnet-id,Values=\$SUBNET_ID
-  4. Fallback: aws ec2 describe-route-tables --filters Name=vpc-id,Values=\$VPC_ID Name=association.main,Values=true
-  5. Public subnet test via JMESPath on routes (default to Internet Gateway)."
+  2. aws ec2 describe-instances --region \$REGION --query 'Reservations[*].Instances[*].InstanceId'
+  3. aws ec2 describe-instances --region \$REGION --instance-ids \$INSTANCE_ID --query 'Reservations[*].Instances[*].SubnetId'
+  4. aws ec2 describe-route-tables --region \$REGION --filters \"Name=association.subnet-id,Values=\$SUBNET_ID\" --query 'RouteTables[*].Routes[]'"
 
-# ====================== Colors ========================
+# Color codes
 GREEN='\033[0;32m'
 RED='\033[0;31m'
 PURPLE='\033[0;35m'
 NC='\033[0m'  # No color
 
-printf "\n---------------------------------------------------------------------\n"
-printf "%bDescription:%b %s\n\n" "$PURPLE" "$NC" "$description"
-printf "%bCriteria:%b %s\n\n" "$PURPLE" "$NC" "$criteria"
-printf "%b%s%b\n" "$PURPLE" "$command_used" "$NC"
-printf "---------------------------------------------------------------------\n\n"
+# Display script metadata
+echo ""
+echo "---------------------------------------------------------------------"
+echo -e "${PURPLE}Description: $description${NC}"
+echo ""
+echo -e "${PURPLE}Criteria: $criteria${NC}"
+echo ""
+echo -e "${PURPLE}$command_used${NC}"
+echo "---------------------------------------------------------------------"
+echo ""
 
-# ====================== Config ========================
-PROFILE="default"
+# Set AWS CLI profile
+PROFILE="my-role"
 
-# Validate profile
-if ! aws configure list-profiles | grep -qx "$PROFILE"; then
-  printf "%bERROR:%b AWS profile '%s' does not exist.\n" "$RED" "$NC" "$PROFILE"
+# Validate if the profile exists
+if ! aws configure list-profiles | grep -q "^$PROFILE$"; then
+  echo "ERROR: AWS profile '$PROFILE' does not exist."
   exit 1
 fi
 
-# Disable CLI pager just in case
-export AWS_PAGER=""
-
-# List regions
+# Get list of all AWS regions
 regions=$(aws ec2 describe-regions --query 'Regions[*].RegionName' --output text --profile "$PROFILE")
 
-# ================== Region/Instance Table =============
-printf "+----------------+----------------------+\n"
-printf "| %-14s | %-20s |\n" "Region" "Instances Found (running)"
-printf "+----------------+----------------------+\n"
+# Table Header
+echo "\n+----------------+----------------+"
+echo "| Region         | Instances Found |"
+echo "+----------------+----------------+"
 
-# Print counts (no Bash 4 assoc arrays)
+# Audit each region
+declare -A region_instance_count
 for REGION in $regions; do
-  rows=$(aws ec2 describe-instances \
-    --region "$REGION" --profile "$PROFILE" \
-    --query 'Reservations[].Instances[][InstanceId,SubnetId,VpcId,State.Name]' \
-    --output text 2>/dev/null || true)
+  instances=$(aws ec2 describe-instances --region "$REGION" --profile "$PROFILE" \
+    --query 'Reservations[*].Instances[*].InstanceId' --output text)
 
-  # keep only running
-  running_rows=$(printf "%s\n" "$rows" | awk '$4=="running" {print}')
-  count=$(printf "%s\n" "$running_rows" | awk 'NF' | wc -l | awk '{print $1}')
-  printf "| %-14s | %-20s |\n" "$REGION" "$count"
+  instance_count=$(echo "$instances" | wc -w)
+  region_instance_count[$REGION]=$instance_count
+
+  printf "| %-14s | %-14s |\n" "$REGION" "$instance_count"
 done
+echo "+----------------+----------------+"
+echo ""
 
-printf "+----------------+----------------------+\n\n"
+# Audit each instance to check if it's in a public subnet
+for REGION in "${!region_instance_count[@]}"; do
+  if [ "${region_instance_count[$REGION]}" -gt 0 ]; then
+    echo -e "${PURPLE}Starting audit for region: $REGION${NC}"
 
-# ================== Audit per Instance ================
-for REGION in $regions; do
-  # Pull once per region (InstanceId SubnetId VpcId State)
-  aws ec2 describe-instances \
-    --region "$REGION" --profile "$PROFILE" \
-    --query 'Reservations[].Instances[][InstanceId,SubnetId,VpcId,State.Name]' \
-    --output text \
-  | awk '$4=="running"' \
-  | while read -r INSTANCE_ID SUBNET_ID VPC_ID STATE; do
-      # Subnet-associated route table
-      RTB_ID=$(aws ec2 describe-route-tables \
-        --region "$REGION" --profile "$PROFILE" \
-        --filters "Name=association.subnet-id,Values=$SUBNET_ID" \
-        --query 'RouteTables[0].RouteTableId' --output text 2>/dev/null || true)
+    for INSTANCE_ID in $(aws ec2 describe-instances --region "$REGION" --profile "$PROFILE" \
+      --query 'Reservations[*].Instances[*].InstanceId' --output text); do
+      
+      # Get the subnet ID for the instance
+      SUBNET_ID=$(aws ec2 describe-instances --region "$REGION" --profile "$PROFILE" \
+        --instance-ids "$INSTANCE_ID" --query 'Reservations[*].Instances[*].SubnetId' --output text)
 
-      # Fallback to main VPC route table if none
-      if [ -z "$RTB_ID" ] || [ "$RTB_ID" = "None" ]; then
-        RTB_ID=$(aws ec2 describe-route-tables \
-          --region "$REGION" --profile "$PROFILE" \
-          --filters "Name=vpc-id,Values=$VPC_ID" "Name=association.main,Values=true" \
-          --query 'RouteTables[0].RouteTableId' --output text 2>/dev/null || true)
+      # Get route table details for the subnet
+      ROUTE_INFO=$(aws ec2 describe-route-tables --region "$REGION" --profile "$PROFILE" \
+        --filters "Name=association.subnet-id,Values=$SUBNET_ID" --query 'RouteTables[*].Routes[]' --output json)
+
+      # Check if instance is in a public subnet (has IGW route)
+      if echo "$ROUTE_INFO" | grep -q '"GatewayId": "igw-'; then
+        STATUS="${RED}Non-Compliant (Instance in Public Subnet)${NC}"
+      else
+        STATUS="${GREEN}Compliant (Instance in Private Subnet)${NC}"
       fi
 
-      STATUS_MSG="Unknown (No route table found)"
-      STATUS_COLOR="$PURPLE"
-
-      if [ -n "${RTB_ID:-}" ] && [ "$RTB_ID" != "None" ]; then
-        # Count default routes to an Internet Gateway (IPv4 and IPv6)
-        IGW_DEFAULT_V4=$(aws ec2 describe-route-tables \
-          --region "$REGION" --profile "$PROFILE" \
-          --route-table-ids "$RTB_ID" \
-          --query "RouteTables[].Routes[?DestinationCidrBlock=='0.0.0.0/0' && contains(GatewayId, 'igw-')]|length(@)" \
-          --output text 2>/dev/null || echo 0)
-
-        IGW_DEFAULT_V6=$(aws ec2 describe-route-tables \
-          --region "$REGION" --profile "$PROFILE" \
-          --route-table-ids "$RTB_ID" \
-          --query "RouteTables[].Routes[?DestinationIpv6CidrBlock=='::/0' && contains(GatewayId, 'igw-')]|length(@)" \
-          --output text 2>/dev/null || echo 0)
-
-        if [ "${IGW_DEFAULT_V4:-0}" -gt 0 ] || [ "${IGW_DEFAULT_V6:-0}" -gt 0 ]; then
-          STATUS_MSG="Non-Compliant (Public Subnet via IGW)"
-          STATUS_COLOR="$RED"
-        else
-          STATUS_MSG="Compliant (No IGW default route)"
-          STATUS_COLOR="$GREEN"
-        fi
-      fi
-
-      printf "--------------------------------------------------\n"
-      printf "Region:      %s\n" "$REGION"
-      printf "Instance ID: %s\n" "$INSTANCE_ID"
-      printf "Subnet ID:   %s\n" "$SUBNET_ID"
-      printf "RouteTable:  %s\n" "${RTB_ID:-None}"
-      printf "%bStatus:%b     %b%s%b\n" "$PURPLE" "$NC" "$STATUS_COLOR" "$STATUS_MSG" "$NC"
-      printf "--------------------------------------------------\n"
+      # Print audit details
+      echo "--------------------------------------------------"
+      echo "Region: $REGION"
+      echo "Instance ID: $INSTANCE_ID"
+      echo "Subnet ID: $SUBNET_ID"
+      echo "Status: $STATUS"
+      echo "--------------------------------------------------"
     done
-  printf "\n"
+  fi
 done
 
-printf "Audit completed for all regions.\n"
+echo "Audit completed for all regions."
