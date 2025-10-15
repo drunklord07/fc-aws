@@ -1,0 +1,1142 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+AWS Full Inventory (tagged + untagged), Prowler-like quick-inventory but complete.
+
+Outputs:
+- CSV: detailed rows
+- Excel: Inventory + Summary
+- CLI tables: per-service, per-type, per-region, grand total
+- Summarized errors printed live and at end
+
+Run:
+  AWS_PROFILE=default python aws_full_inventory_all.py --out ./output
+  python aws_full_inventory_all.py --regions ap-south-1,us-east-1 --services ec2,s3,iam
+
+"""
+
+import argparse
+import csv
+import os
+import sys
+import time
+from collections import defaultdict, Counter
+
+import boto3
+from botocore.config import Config
+from botocore.exceptions import ClientError, EndpointConnectionError, NoRegionError
+
+# Optional (Excel)
+try:
+    import pandas as pd
+    HAVE_PANDAS = True
+except Exception:
+    HAVE_PANDAS = False
+
+# ------------------ Utilities ------------------
+
+def now_iso():
+    return time.strftime("%Y-%m-%dT%H-%M-%S", time.gmtime())
+
+def ensure_dir(p):
+    os.makedirs(p, exist_ok=True)
+    return p
+
+def join_tags_dict(d):
+    if not d:
+        return ""
+    return "|".join(f"{k}={d[k]}" for k in sorted(d.keys()))
+
+def normalize_kv_tags(tag_list, key_field="Key", val_field="Value"):
+    out = {}
+    if not tag_list:
+        return out
+    for t in tag_list:
+        k = t.get(key_field) or t.get(key_field.lower())
+        v = t.get(val_field) or t.get(val_field.lower())
+        if k is not None and v is not None:
+            out[str(k)] = str(v)
+    return out
+
+def safe_client(service, region_name=None):
+    cfg = Config(retries={"max_attempts": 10, "mode": "adaptive"})
+    try:
+        return boto3.client(service, region_name=region_name, config=cfg)
+    except Exception:
+        return None
+
+def get_account_id():
+    try:
+        return boto3.client("sts").get_caller_identity()["Account"]
+    except Exception:
+        return "UNKNOWN"
+
+def get_enabled_regions():
+    regions = []
+    try:
+        ec2 = safe_client("ec2", region_name="us-east-1")
+        if ec2:
+            resp = ec2.describe_regions(AllRegions=False)
+            regions = [r["RegionName"] for r in resp.get("Regions", [])]
+    except Exception:
+        pass
+    return regions
+
+def write_csv(path, header, rows):
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=header)
+        w.writeheader()
+        for r in rows:
+            w.writerow(r)
+
+def write_excel(detail_rows, summary_rows, xlsx_path):
+    if not HAVE_PANDAS:
+        return False, "pandas/openpyxl not installed; skipped Excel."
+    try:
+        df = pd.DataFrame(detail_rows)
+        df2 = pd.DataFrame(summary_rows)
+        with pd.ExcelWriter(xlsx_path, engine="openpyxl") as xw:
+            df.to_excel(xw, index=False, sheet_name="Inventory")
+            df2.to_excel(xw, index=False, sheet_name="Summary")
+        return True, f"Excel written: {xlsx_path}"
+    except Exception as e:
+        return False, f"Excel failed: {e}"
+
+def print_table_div():
+    print("-" * 88)
+
+def record_error(errors, where, err):
+    # where = "service (region) op" or similar
+    if isinstance(err, ClientError):
+        code = err.response.get("Error", {}).get("Code", "ClientError")
+        msg = err.response.get("Error", {}).get("Message", str(err))
+        s = f"{where}: {code} - {msg}"
+    else:
+        s = f"{where}: {str(err)}"
+    errors.append(s)
+    print(f"[ERROR] {s}")
+
+# Best-effort ARN builders for common services when ARN not in payload
+def arn_ec2(resource_type, region, account, resource_id):
+    return f"arn:aws:ec2:{region}:{account}:{resource_type}/{resource_id}"
+
+def arn_elbv2(region, account, lb_arn):
+    # Already an ARN usually; return as-is
+    return lb_arn
+
+def arn_elb(region, account, name):
+    return f"arn:aws:elasticloadbalancing:{region}:{account}:loadbalancer/{name}"
+
+def arn_lambda(region, account, function_name):
+    return f"arn:aws:lambda:{region}:{account}:function:{function_name}"
+
+def arn_rds_db(region, account, db_id):
+    return f"arn:aws:rds:{region}:{account}:db:{db_id}"
+
+def arn_rds_cluster(region, account, cluster_id):
+    return f"arn:aws:rds:{region}:{account}:cluster:{cluster_id}"
+
+def arn_logs_group(region, account, name):
+    return f"arn:aws:logs:{region}:{account}:log-group:{name}"
+
+def arn_kms(region, account, key_id):
+    return f"arn:aws:kms:{region}:{account}:key/{key_id}"
+
+def arn_s3_bucket(bucket):
+    return f"arn:aws:s3:::{bucket}"
+
+def arn_iam(kind, account, name):  # kind=user|role|group|policy
+    if kind == "policy":
+        # customer-managed; AWS-managed use different partition/paths, but most have Arn already in list_policies
+        return f"arn:aws:iam::{account}:policy/{name}"
+    return f"arn:aws:iam::{account}:{kind}/{name}"
+
+def arn_eks_cluster(region, account, name):
+    return f"arn:aws:eks:{region}:{account}:cluster/{name}"
+
+def arn_ecr_repo(region, account, name):
+    return f"arn:aws:ecr:{region}:{account}:repository/{name}"
+
+def arn_dynamodb_table(region, account, name):
+    return f"arn:aws:dynamodb:{region}:{account}:table/{name}"
+
+def arn_sns_topic(topic_arn):  # already arn
+    return topic_arn
+
+def arn_sqs_queue(queue_url, region, account):
+    # queue URL like https://sqs.<region>.amazonaws.com/<account>/<name>
+    # ARN: arn:aws:sqs:<region>:<account>:<name>
+    try:
+        name = queue_url.rstrip("/").split("/")[-1]
+        return f"arn:aws:sqs:{region}:{account}:{name}"
+    except Exception:
+        return ""
+
+def arn_apigw_rest(region, account, api_id):
+    return f"arn:aws:apigateway:{region}::/restapis/{api_id}"
+
+def arn_apigw_v2(region, account, api_id):
+    return f"arn:aws:apigateway:{region}::/apis/{api_id}"
+
+def arn_acm(region, account, cert_arn):
+    return cert_arn  # ACM returns ARNs
+
+def arn_cloudfront_dist(id_):
+    return f"arn:aws:cloudfront::{get_account_id()}:distribution/{id_}"
+
+def arn_route53_zone(id_or_name):
+    # Hosted zone ID may be like /hostedzone/XYZ; Route53 is global and ARNs are odd; keep ID as 'ARN' if not trivial
+    return str(id_or_name)
+
+# ------------------ Collectors ------------------
+
+def collect_ec2(region, account, errors):
+    out = []
+    c = safe_client("ec2", region)
+    if not c: return out
+    # Instances
+    try:
+        pg = c.get_paginator("describe_instances")
+        for page in pg.paginate():
+            for res in page.get("Reservations", []):
+                for inst in res.get("Instances", []):
+                    rid = inst.get("InstanceId","")
+                    name = ""
+                    tdict = normalize_kv_tags(inst.get("Tags", []))
+                    if "Name" in tdict: name = tdict["Name"]
+                    out.append(dict(SERVICE="ec2", RESOURCE_TYPE="Instance", RESOURCE_ID=rid,
+                                    RESOURCE_ARN=arn_ec2("instance", region, account, rid),
+                                    RESOURCE_NAME=name, REGION=region, TAGS=join_tags_dict(tdict)))
+    except Exception as e:
+        record_error(errors, f"ec2({region}) describe_instances", e)
+    # Volumes
+    try:
+        pg = c.get_paginator("describe_volumes")
+        for page in pg.paginate():
+            for vol in page.get("Volumes", []):
+                rid = vol.get("VolumeId","")
+                tdict = normalize_kv_tags(vol.get("Tags", []))
+                out.append(dict(SERVICE="ec2", RESOURCE_TYPE="Volume", RESOURCE_ID=rid,
+                                RESOURCE_ARN=arn_ec2("volume", region, account, rid),
+                                RESOURCE_NAME="", REGION=region, TAGS=join_tags_dict(tdict)))
+    except Exception as e:
+        record_error(errors, f"ec2({region}) describe_volumes", e)
+    # VPCs
+    try:
+        pg = c.get_paginator("describe_vpcs")
+        for page in pg.paginate():
+            for v in page.get("Vpcs", []):
+                rid = v.get("VpcId","")
+                tdict = normalize_kv_tags(v.get("Tags", []))
+                out.append(dict(SERVICE="ec2", RESOURCE_TYPE="VPC", RESOURCE_ID=rid,
+                                RESOURCE_ARN=arn_ec2("vpc", region, account, rid),
+                                RESOURCE_NAME="", REGION=region, TAGS=join_tags_dict(tdict)))
+    except Exception as e:
+        record_error(errors, f"ec2({region}) describe_vpcs", e)
+    # Subnets
+    try:
+        pg = c.get_paginator("describe_subnets")
+        for page in pg.paginate():
+            for s in page.get("Subnets", []):
+                rid = s.get("SubnetId","")
+                tdict = normalize_kv_tags(s.get("Tags", []))
+                out.append(dict(SERVICE="ec2", RESOURCE_TYPE="Subnet", RESOURCE_ID=rid,
+                                RESOURCE_ARN=arn_ec2("subnet", region, account, rid),
+                                RESOURCE_NAME="", REGION=region, TAGS=join_tags_dict(tdict)))
+    except Exception as e:
+        record_error(errors, f"ec2({region}) describe_subnets", e)
+    # Security Groups
+    try:
+        pg = c.get_paginator("describe_security_groups")
+        for page in pg.paginate():
+            for g in page.get("SecurityGroups", []):
+                rid = g.get("GroupId","")
+                tdict = normalize_kv_tags(g.get("Tags", []))
+                out.append(dict(SERVICE="ec2", RESOURCE_TYPE="SecurityGroup", RESOURCE_ID=rid,
+                                RESOURCE_ARN=arn_ec2("security-group", region, account, rid),
+                                RESOURCE_NAME=g.get("GroupName",""), REGION=region, TAGS=join_tags_dict(tdict)))
+    except Exception as e:
+        record_error(errors, f"ec2({region}) describe_security_groups", e)
+    # IGW
+    try:
+        pg = c.get_paginator("describe_internet_gateways")
+        for page in pg.paginate():
+            for igw in page.get("InternetGateways", []):
+                rid = igw.get("InternetGatewayId","")
+                tdict = normalize_kv_tags(igw.get("Tags", []))
+                out.append(dict(SERVICE="ec2", RESOURCE_TYPE="InternetGateway", RESOURCE_ID=rid,
+                                RESOURCE_ARN=arn_ec2("internet-gateway", region, account, rid),
+                                RESOURCE_NAME="", REGION=region, TAGS=join_tags_dict(tdict)))
+    except Exception as e:
+        record_error(errors, f"ec2({region}) describe_internet_gateways", e)
+    # NATGW
+    try:
+        pg = c.get_paginator("describe_nat_gateways")
+        for page in pg.paginate():
+            for nat in page.get("NatGateways", []):
+                rid = nat.get("NatGatewayId","")
+                out.append(dict(SERVICE="ec2", RESOURCE_TYPE="NatGateway", RESOURCE_ID=rid,
+                                RESOURCE_ARN=arn_ec2("natgateway", region, account, rid),
+                                RESOURCE_NAME="", REGION=region, TAGS=""))
+    except Exception as e:
+        record_error(errors, f"ec2({region}) describe_nat_gateways", e)
+    return out
+
+def collect_elbv2(region, account, errors):
+    out = []
+    c = safe_client("elbv2", region)
+    if not c: return out
+    try:
+        pg = c.get_paginator("describe_load_balancers")
+        for page in pg.paginate():
+            lbs = page.get("LoadBalancers", [])
+            arns = [lb["LoadBalancerArn"] for lb in lbs if "LoadBalancerArn" in lb]
+            tag_map = {}
+            # fetch tags in chunks
+            for i in range(0, len(arns), 20):
+                try:
+                    tr = c.describe_tags(ResourceArns=arns[i:i+20])
+                    for d in tr.get("TagDescriptions", []):
+                        tag_map[d["ResourceArn"]] = normalize_kv_tags(d.get("Tags", []))
+                except Exception as e:
+                    record_error(errors, f"elbv2({region}) describe_tags", e)
+            for lb in lbs:
+                arn = lb.get("LoadBalancerArn","")
+                rid = arn.split("/")[-1] if arn else lb.get("DNSName","")
+                rtype = lb.get("Type","load-balancer").capitalize()
+                tdict = tag_map.get(arn, {})
+                out.append(dict(SERVICE="elbv2", RESOURCE_TYPE=rtype, RESOURCE_ID=rid,
+                                RESOURCE_ARN=arn_elbv2(region, account, arn),
+                                RESOURCE_NAME=lb.get("LoadBalancerName",""), REGION=region,
+                                TAGS=join_tags_dict(tdict)))
+    except Exception as e:
+        record_error(errors, f"elbv2({region}) describe_load_balancers", e)
+    return out
+
+def collect_elb(region, account, errors):
+    out = []
+    c = safe_client("elb", region)
+    if not c: return out
+    try:
+        pg = c.get_paginator("describe_load_balancers")
+        for page in pg.paginate():
+            for lb in page.get("LoadBalancerDescriptions", []):
+                name = lb.get("LoadBalancerName","")
+                out.append(dict(SERVICE="elb", RESOURCE_TYPE="ClassicLoadBalancer", RESOURCE_ID=name,
+                                RESOURCE_ARN=arn_elb(region, account, name),
+                                RESOURCE_NAME=name, REGION=region, TAGS=""))
+    except Exception as e:
+        record_error(errors, f"elb({region}) describe_load_balancers", e)
+    return out
+
+def collect_rds(region, account, errors):
+    out = []
+    c = safe_client("rds", region)
+    if not c: return out
+    # DB Instances
+    try:
+        pg = c.get_paginator("describe_db_instances")
+        for page in pg.paginate():
+            for db in page.get("DBInstances", []):
+                rid = db.get("DBInstanceIdentifier","")
+                arn = db.get("DBInstanceArn") or arn_rds_db(region, account, rid)
+                name = db.get("DBName","") or rid
+                tdict = {}
+                try:
+                    if arn:
+                        tdict = normalize_kv_tags(c.list_tags_for_resource(ResourceName=arn).get("TagList", []))
+                except Exception as e:
+                    record_error(errors, f"rds({region}) list_tags_for_resource(db:{rid})", e)
+                out.append(dict(SERVICE="rds", RESOURCE_TYPE="DBInstance", RESOURCE_ID=rid,
+                                RESOURCE_ARN=arn, RESOURCE_NAME=name, REGION=region,
+                                TAGS=join_tags_dict(tdict)))
+    except Exception as e:
+        record_error(errors, f"rds({region}) describe_db_instances", e)
+    # DB Clusters
+    try:
+        pg = c.get_paginator("describe_db_clusters")
+        for page in pg.paginate():
+            for cl in page.get("DBClusters", []):
+                rid = cl.get("DBClusterIdentifier","")
+                arn = cl.get("DBClusterArn") or arn_rds_cluster(region, account, rid)
+                tdict = {}
+                try:
+                    if arn:
+                        tdict = normalize_kv_tags(c.list_tags_for_resource(ResourceName=arn).get("TagList", []))
+                except Exception as e:
+                    record_error(errors, f"rds({region}) list_tags_for_resource(cluster:{rid})", e)
+                out.append(dict(SERVICE="rds", RESOURCE_TYPE="DBCluster", RESOURCE_ID=rid,
+                                RESOURCE_ARN=arn, RESOURCE_NAME=rid, REGION=region,
+                                TAGS=join_tags_dict(tdict)))
+    except Exception as e:
+        record_error(errors, f"rds({region}) describe_db_clusters", e)
+    return out
+
+def collect_lambda(region, account, errors):
+    out = []
+    c = safe_client("lambda", region)
+    if not c: return out
+    try:
+        pg = c.get_paginator("list_functions")
+        for page in pg.paginate():
+            for fn in page.get("Functions", []):
+                name = fn.get("FunctionName","")
+                arn = fn.get("FunctionArn") or arn_lambda(region, account, name)
+                tdict = {}
+                try:
+                    if arn:
+                        tdict = c.list_tags(Resource=arn).get("Tags", {})
+                except Exception as e:
+                    record_error(errors, f"lambda({region}) list_tags({name})", e)
+                out.append(dict(SERVICE="lambda", RESOURCE_TYPE="Function", RESOURCE_ID=name,
+                                RESOURCE_ARN=arn, RESOURCE_NAME=name, REGION=region,
+                                TAGS=join_tags_dict(tdict)))
+    except Exception as e:
+        record_error(errors, f"lambda({region}) list_functions", e)
+    return out
+
+def collect_logs(region, account, errors):
+    out = []
+    c = safe_client("logs", region)
+    if not c: return out
+    try:
+        pg = c.get_paginator("describe_log_groups")
+        for page in pg.paginate():
+            for lg in page.get("logGroups", []):
+                name = lg.get("logGroupName","")
+                arn = lg.get("arn") or arn_logs_group(region, account, name)
+                tdict = {}
+                try:
+                    tdict = c.list_tags_log_group(logGroupName=name).get("tags", {})
+                except Exception as e:
+                    record_error(errors, f"logs({region}) list_tags_log_group({name})", e)
+                out.append(dict(SERVICE="cloudwatch", RESOURCE_TYPE="LogGroup", RESOURCE_ID=name,
+                                RESOURCE_ARN=arn, RESOURCE_NAME=name, REGION=region,
+                                TAGS=join_tags_dict(tdict)))
+    except Exception as e:
+        record_error(errors, f"logs({region}) describe_log_groups", e)
+    return out
+
+def collect_kms(region, account, errors):
+    out = []
+    c = safe_client("kms", region)
+    if not c: return out
+    try:
+        pg = c.get_paginator("list_keys")
+        for page in pg.paginate():
+            for k in page.get("Keys", []):
+                key_id = k.get("KeyId","")
+                arn = ""
+                try:
+                    meta = c.describe_key(KeyId=key_id).get("KeyMetadata", {})
+                    arn = meta.get("Arn", arn_kms(region, account, key_id))
+                except Exception as e:
+                    record_error(errors, f"kms({region}) describe_key({key_id})", e)
+                tdict = {}
+                try:
+                    tdict = {t["TagKey"]: t["TagValue"] for t in c.list_resource_tags(KeyId=key_id).get("Tags", [])}
+                except Exception as e:
+                    record_error(errors, f"kms({region}) list_resource_tags({key_id})", e)
+                out.append(dict(SERVICE="kms", RESOURCE_TYPE="Key", RESOURCE_ID=key_id,
+                                RESOURCE_ARN=arn or arn_kms(region, account, key_id),
+                                RESOURCE_NAME=meta.get("Description","") if 'meta' in locals() else "",
+                                REGION=region, TAGS=join_tags_dict(tdict)))
+    except Exception as e:
+        record_error(errors, f"kms({region}) list_keys", e)
+    return out
+
+def collect_eks(region, account, errors):
+    out = []
+    c = safe_client("eks", region)
+    if not c: return out
+    try:
+        pg = c.get_paginator("list_clusters")
+        for page in pg.paginate():
+            for name in page.get("clusters", []):
+                arn = arn_eks_cluster(region, account, name)
+                tdict = {}
+                try:
+                    arntags = c.list_tags_for_resource(resourceArn=arn).get("tags", {})
+                    tdict = arntags
+                except Exception as e:
+                    record_error(errors, f"eks({region}) list_tags_for_resource({name})", e)
+                out.append(dict(SERVICE="eks", RESOURCE_TYPE="Cluster", RESOURCE_ID=name,
+                                RESOURCE_ARN=arn, RESOURCE_NAME=name, REGION=region,
+                                TAGS=join_tags_dict(tdict)))
+    except Exception as e:
+        record_error(errors, f"eks({region}) list_clusters", e)
+    return out
+
+def collect_ecr(region, account, errors):
+    out = []
+    c = safe_client("ecr", region)
+    if not c: return out
+    try:
+        pg = c.get_paginator("describe_repositories")
+        for page in pg.paginate():
+            for r in page.get("repositories", []):
+                name = r.get("repositoryName","")
+                arn = r.get("repositoryArn") or arn_ecr_repo(region, account, name)
+                tdict = {}
+                try:
+                    tr = c.list_tags_for_resource(resourceArn=arn)
+                    tdict = tr.get("tags", {})
+                except Exception as e:
+                    record_error(errors, f"ecr({region}) list_tags_for_resource({name})", e)
+                out.append(dict(SERVICE="ecr", RESOURCE_TYPE="Repository", RESOURCE_ID=name,
+                                RESOURCE_ARN=arn, RESOURCE_NAME=name, REGION=region,
+                                TAGS=join_tags_dict(tdict)))
+    except Exception as e:
+        record_error(errors, f"ecr({region}) describe_repositories", e)
+    return out
+
+def collect_ecs(region, account, errors):
+    out = []
+    c = safe_client("ecs", region)
+    if not c: return out
+    # Clusters
+    try:
+        pg = c.get_paginator("list_clusters")
+        for page in pg.paginate():
+            for arn in page.get("clusterArns", []):
+                name = arn.split("/")[-1]
+                out.append(dict(SERVICE="ecs", RESOURCE_TYPE="Cluster", RESOURCE_ID=name,
+                                RESOURCE_ARN=arn, RESOURCE_NAME=name, REGION=region, TAGS=""))
+    except Exception as e:
+        record_error(errors, f"ecs({region}) list_clusters", e)
+    # Task definitions (names only)
+    try:
+        pg = c.get_paginator("list_task_definitions")
+        for page in pg.paginate():
+            for tdarn in page.get("taskDefinitionArns", []):
+                name = tdarn.split("/")[-1]
+                out.append(dict(SERVICE="ecs", RESOURCE_TYPE="TaskDefinition", RESOURCE_ID=name,
+                                RESOURCE_ARN=tdarn, RESOURCE_NAME=name, REGION=region, TAGS=""))
+    except Exception as e:
+        record_error(errors, f"ecs({region}) list_task_definitions", e)
+    return out
+
+def collect_dynamodb(region, account, errors):
+    out = []
+    c = safe_client("dynamodb", region)
+    if not c: return out
+    try:
+        pg = c.get_paginator("list_tables")
+        for page in pg.paginate():
+            for name in page.get("TableNames", []):
+                out.append(dict(SERVICE="dynamodb", RESOURCE_TYPE="Table", RESOURCE_ID=name,
+                                RESOURCE_ARN=arn_dynamodb_table(region, account, name),
+                                RESOURCE_NAME=name, REGION=region, TAGS=""))
+    except Exception as e:
+        record_error(errors, f"dynamodb({region}) list_tables", e)
+    return out
+
+def collect_cloudtrail(region, account, errors):
+    out = []
+    c = safe_client("cloudtrail", region)
+    if not c: return out
+    try:
+        pg = c.get_paginator("list_trails")
+        for page in pg.paginate():
+            for t in page.get("Trails", []):
+                arn = t.get("TrailARN","")
+                name = t.get("Name","")
+                out.append(dict(SERVICE="cloudtrail", RESOURCE_TYPE="Trail", RESOURCE_ID=name,
+                                RESOURCE_ARN=arn or name, RESOURCE_NAME=name, REGION=region, TAGS=""))
+    except Exception as e:
+        record_error(errors, f"cloudtrail({region}) list_trails", e)
+    return out
+
+def collect_cloudfront_global(account, errors):
+    out = []
+    c = safe_client("cloudfront", region_name="us-east-1")
+    if not c: return out
+    try:
+        pg = c.get_paginator("list_distributions")
+        for page in pg.paginate():
+            items = page.get("DistributionList", {}).get("Items", [])
+            for d in items:
+                did = d.get("Id","")
+                arn = d.get("ARN") or arn_cloudfront_dist(did)
+                out.append(dict(SERVICE="cloudfront", RESOURCE_TYPE="Distribution", RESOURCE_ID=did,
+                                RESOURCE_ARN=arn, RESOURCE_NAME=did, REGION="aws-global", TAGS=""))
+    except Exception as e:
+        record_error(errors, "cloudfront(global) list_distributions", e)
+    return out
+
+def collect_route53_global(account, errors):
+    out = []
+    c = safe_client("route53", region_name="us-east-1")
+    if not c: return out
+    try:
+        pg = c.get_paginator("list_hosted_zones")
+        for page in pg.paginate():
+            for hz in page.get("HostedZones", []):
+                name = hz.get("Name","").rstrip(".")
+                rid = hz.get("Id","")
+                out.append(dict(SERVICE="route53", RESOURCE_TYPE="HostedZone", RESOURCE_ID=name,
+                                RESOURCE_ARN=arn_route53_zone(rid), RESOURCE_NAME=name,
+                                REGION="aws-global", TAGS=""))
+    except Exception as e:
+        record_error(errors, "route53(global) list_hosted_zones", e)
+    return out
+
+def collect_route53domains_global(account, errors):
+    out = []
+    c = safe_client("route53domains", region_name="us-east-1")
+    if not c: return out
+    try:
+        pg = c.get_paginator("list_domains")
+        for page in pg.paginate():
+            for dom in page.get("Domains", []):
+                name = dom.get("DomainName","")
+                out.append(dict(SERVICE="route53domains", RESOURCE_TYPE="Domain", RESOURCE_ID=name,
+                                RESOURCE_ARN=name, RESOURCE_NAME=name, REGION="aws-global", TAGS=""))
+    except Exception as e:
+        record_error(errors, "route53domains(global) list_domains", e)
+    return out
+
+def collect_s3_global(account, errors):
+    out = []
+    c = safe_client("s3")
+    if not c: return out
+    try:
+        resp = c.list_buckets()
+        for b in resp.get("Buckets", []):
+            name = b.get("Name","")
+            # region
+            try:
+                loc = c.get_bucket_location(Bucket=name).get("LocationConstraint") or "us-east-1"
+            except Exception as e:
+                record_error(errors, f"s3(global) get_bucket_location({name})", e)
+                loc = "unknown"
+            # tags
+            tdict = {}
+            try:
+                tr = c.get_bucket_tagging(Bucket=name)
+                tdict = normalize_kv_tags(tr.get("TagSet", []))
+            except Exception as e:
+                # no tags or AccessDenied
+                pass
+            out.append(dict(SERVICE="s3", RESOURCE_TYPE="Bucket", RESOURCE_ID=name,
+                            RESOURCE_ARN=arn_s3_bucket(name), RESOURCE_NAME=name,
+                            REGION=loc, TAGS=join_tags_dict(tdict)))
+    except Exception as e:
+        record_error(errors, "s3(global) list_buckets", e)
+    return out
+
+def collect_iam_global(account, errors):
+    out = []
+    c = safe_client("iam", region_name="us-east-1")
+    if not c: return out
+    # Users
+    try:
+        pg = c.get_paginator("list_users")
+        for page in pg.paginate():
+            for u in page.get("Users", []):
+                name = u.get("UserName","")
+                arn = u.get("Arn") or arn_iam("user", account, name)
+                tdict = {}
+                try:
+                    tdict = normalize_kv_tags(c.list_user_tags(UserName=name).get("Tags", []))
+                except Exception as e:
+                    record_error(errors, f"iam(global) list_user_tags({name})", e)
+                out.append(dict(SERVICE="iam", RESOURCE_TYPE="User", RESOURCE_ID=name,
+                                RESOURCE_ARN=arn, RESOURCE_NAME=name, REGION="aws-global",
+                                TAGS=join_tags_dict(tdict)))
+    except Exception as e:
+        record_error(errors, "iam(global) list_users", e)
+    # Roles
+    try:
+        pg = c.get_paginator("list_roles")
+        for page in pg.paginate():
+            for r in page.get("Roles", []):
+                name = r.get("RoleName","")
+                arn = r.get("Arn") or arn_iam("role", account, name)
+                tdict = {}
+                try:
+                    tdict = normalize_kv_tags(c.list_role_tags(RoleName=name).get("Tags", []))
+                except Exception as e:
+                    record_error(errors, f"iam(global) list_role_tags({name})", e)
+                out.append(dict(SERVICE="iam", RESOURCE_TYPE="Role", RESOURCE_ID=name,
+                                RESOURCE_ARN=arn, RESOURCE_NAME=name, REGION="aws-global",
+                                TAGS=join_tags_dict(tdict)))
+    except Exception as e:
+        record_error(errors, "iam(global) list_roles", e)
+    # Groups
+    try:
+        pg = c.get_paginator("list_groups")
+        for page in pg.paginate():
+            for g in page.get("Groups", []):
+                name = g.get("GroupName","")
+                arn = g.get("Arn") or arn_iam("group", account, name)
+                out.append(dict(SERVICE="iam", RESOURCE_TYPE="Group", RESOURCE_ID=name,
+                                RESOURCE_ARN=arn, RESOURCE_NAME=name, REGION="aws-global",
+                                TAGS=""))
+    except Exception as e:
+        record_error(errors, "iam(global) list_groups", e)
+    # Policies
+    try:
+        pg = c.get_paginator("list_policies")
+        for page in pg.paginate(Scope="All"):
+            for p in page.get("Policies", []):
+                name = p.get("PolicyName","")
+                arn = p.get("Arn") or arn_iam("policy", account, name)
+                out.append(dict(SERVICE="iam", RESOURCE_TYPE="Policy", RESOURCE_ID=name,
+                                RESOURCE_ARN=arn, RESOURCE_NAME=name, REGION="aws-global",
+                                TAGS=""))
+    except Exception as e:
+        record_error(errors, "iam(global) list_policies", e)
+    return out
+
+def collect_secretsmanager(region, account, errors):
+    out = []
+    c = safe_client("secretsmanager", region)
+    if not c: return out
+    try:
+        pg = c.get_paginator("list_secrets")
+        for page in pg.paginate():
+            for s in page.get("SecretList", []):
+                name = s.get("Name","")
+                arn = s.get("ARN","")
+                tdict = normalize_kv_tags(s.get("Tags", []))
+                out.append(dict(SERVICE="secretsmanager", RESOURCE_TYPE="Secret", RESOURCE_ID=name,
+                                RESOURCE_ARN=arn or name, RESOURCE_NAME=name, REGION=region,
+                                TAGS=join_tags_dict(tdict)))
+    except Exception as e:
+        record_error(errors, f"secretsmanager({region}) list_secrets", e)
+    return out
+
+def collect_sqs(region, account, errors):
+    out = []
+    c = safe_client("sqs", region)
+    if not c: return out
+    try:
+        resp = c.list_queues()
+        for url in resp.get("QueueUrls", []) or []:
+            out.append(dict(SERVICE="sqs", RESOURCE_TYPE="Queue", RESOURCE_ID=url.split("/")[-1],
+                            RESOURCE_ARN=arn_sqs_queue(url, region, account), RESOURCE_NAME=url.split("/")[-1],
+                            REGION=region, TAGS=""))
+    except Exception as e:
+        record_error(errors, f"sqs({region}) list_queues", e)
+    return out
+
+def collect_sns(region, account, errors):
+    out = []
+    c = safe_client("sns", region)
+    if not c: return out
+    try:
+        pg = c.get_paginator("list_topics")
+        for page in pg.paginate():
+            for t in page.get("Topics", []):
+                arn = t.get("TopicArn","")
+                name = arn.split(":")[-1] if arn else ""
+                out.append(dict(SERVICE="sns", RESOURCE_TYPE="Topic", RESOURCE_ID=name,
+                                RESOURCE_ARN=arn_sns_topic(arn), RESOURCE_NAME=name, REGION=region, TAGS=""))
+    except Exception as e:
+        record_error(errors, f"sns({region}) list_topics", e)
+    return out
+
+def collect_apigw(region, account, errors):
+    out = []
+    c1 = safe_client("apigateway", region)      # REST APIs
+    c2 = safe_client("apigatewayv2", region)    # HTTP/WebSocket APIs
+    if c1:
+        try:
+            pg = c1.get_paginator("get_rest_apis")
+            for page in pg.paginate():
+                for api in page.get("items", []):
+                    api_id = api.get("id","")
+                    name = api.get("name","")
+                    out.append(dict(SERVICE="apigateway", RESOURCE_TYPE="RestApi", RESOURCE_ID=api_id,
+                                    RESOURCE_ARN=arn_apigw_rest(region, account, api_id),
+                                    RESOURCE_NAME=name or api_id, REGION=region, TAGS=""))
+        except Exception as e:
+            record_error(errors, f"apigateway({region}) get_rest_apis", e)
+    if c2:
+        try:
+            pg = c2.get_paginator("get_apis")
+            for page in pg.paginate():
+                for api in page.get("Items", []):
+                    api_id = api.get("ApiId","")
+                    name = api.get("Name","")
+                    out.append(dict(SERVICE="apigatewayv2", RESOURCE_TYPE="Api", RESOURCE_ID=api_id,
+                                    RESOURCE_ARN=arn_apigw_v2(region, account, api_id),
+                                    RESOURCE_NAME=name or api_id, REGION=region, TAGS=""))
+        except Exception as e:
+            record_error(errors, f"apigatewayv2({region}) get_apis", e)
+    return out
+
+def collect_acm(region, account, errors):
+    out = []
+    c = safe_client("acm", region)
+    if not c: return out
+    try:
+        pg = c.get_paginator("list_certificates")
+        for page in pg.paginate():
+            for cert in page.get("CertificateSummaryList", []):
+                arn = cert.get("CertificateArn","")
+                name = cert.get("DomainName","")
+                out.append(dict(SERVICE="acm", RESOURCE_TYPE="Certificate", RESOURCE_ID=name or arn.split("/")[-1],
+                                RESOURCE_ARN=arn_acm(region, account, arn), RESOURCE_NAME=name or "", REGION=region,
+                                TAGS=""))
+    except Exception as e:
+        record_error(errors, f"acm({region}) list_certificates", e)
+    return out
+
+def collect_cloudformation(region, account, errors):
+    out = []
+    c = safe_client("cloudformation", region)
+    if not c: return out
+    try:
+        pg = c.get_paginator("list_stacks")
+        for page in pg.paginate():
+            for st in page.get("StackSummaries", []):
+                name = st.get("StackName","")
+                arn = st.get("StackId","")
+                out.append(dict(SERVICE="cloudformation", RESOURCE_TYPE="Stack", RESOURCE_ID=name,
+                                RESOURCE_ARN=arn or name, RESOURCE_NAME=name, REGION=region, TAGS=""))
+    except Exception as e:
+        record_error(errors, f"cloudformation({region}) list_stacks", e)
+    return out
+
+def collect_elasticache(region, account, errors):
+    out = []
+    c = safe_client("elasticache", region)
+    if not c: return out
+    try:
+        pg = c.get_paginator("describe_cache_clusters")
+        for page in pg.paginate(ShowCacheNodeInfo=False):
+            for cc in page.get("CacheClusters", []):
+                rid = cc.get("CacheClusterId","")
+                out.append(dict(SERVICE="elasticache", RESOURCE_TYPE="CacheCluster", RESOURCE_ID=rid,
+                                RESOURCE_ARN=f"arn:aws:elasticache:{region}:{account}:cluster:{rid}",
+                                RESOURCE_NAME=rid, REGION=region, TAGS=""))
+    except Exception as e:
+        record_error(errors, f"elasticache({region}) describe_cache_clusters", e)
+    return out
+
+def collect_redshift(region, account, errors):
+    out = []
+    c = safe_client("redshift", region)
+    if not c: return out
+    try:
+        pg = c.get_paginator("describe_clusters")
+        for page in pg.paginate():
+            for cl in page.get("Clusters", []):
+                rid = cl.get("ClusterIdentifier","")
+                arn = cl.get("ClusterNamespaceArn", "")
+                out.append(dict(SERVICE="redshift", RESOURCE_TYPE="Cluster", RESOURCE_ID=rid,
+                                RESOURCE_ARN=arn or f"arn:aws:redshift:{region}:{account}:cluster:{rid}",
+                                RESOURCE_NAME=rid, REGION=region, TAGS=""))
+    except Exception as e:
+        record_error(errors, f"redshift({region}) describe_clusters", e)
+    return out
+
+def collect_redshift_serverless(region, account, errors):
+    out = []
+    c = safe_client("redshift-serverless", region)
+    if not c: return out
+    try:
+        ns = c.list_namespaces().get("namespaces", [])
+        for n in ns:
+            arn = n.get("namespaceArn","")
+            out.append(dict(SERVICE="redshift-serverless", RESOURCE_TYPE="Namespace", RESOURCE_ID=n.get("namespaceName",""),
+                            RESOURCE_ARN=arn or "", RESOURCE_NAME=n.get("namespaceName",""),
+                            REGION=region, TAGS=join_tags_dict(n.get("tags", {}))))
+        wgs = c.list_workgroups().get("workgroups", [])
+        for w in wgs:
+            arn = w.get("workgroupArn","")
+            out.append(dict(SERVICE="redshift-serverless", RESOURCE_TYPE="Workgroup", RESOURCE_ID=w.get("workgroupName",""),
+                            RESOURCE_ARN=arn or "", RESOURCE_NAME=w.get("workgroupName",""),
+                            REGION=region, TAGS=join_tags_dict(w.get("tags", {}))))
+    except Exception as e:
+        record_error(errors, f"redshift-serverless({region}) list_*", e)
+    return out
+
+def collect_glue(region, account, errors):
+    out = []
+    c = safe_client("glue", region)
+    if not c: return out
+    try:
+        pg = c.get_paginator("get_crawlers")
+        for page in pg.paginate():
+            for cr in page.get("Crawlers", []):
+                name = cr.get("Name","")
+                out.append(dict(SERVICE="glue", RESOURCE_TYPE="Crawler", RESOURCE_ID=name,
+                                RESOURCE_ARN=name, RESOURCE_NAME=name, REGION=region, TAGS=""))
+    except Exception as e:
+        record_error(errors, f"glue({region}) get_crawlers", e)
+    return out
+
+def collect_code_family(region, account, errors):
+    out = []
+    # CodeCommit
+    ccc = safe_client("codecommit", region)
+    if ccc:
+        try:
+            pg = ccc.get_paginator("list_repositories")
+            for page in pg.paginate():
+                for r in page.get("repositories", []):
+                    name = r.get("repositoryName","")
+                    arn = r.get("Arn","") if "Arn" in r else f"arn:aws:codecommit:{region}:{account}:{name}"
+                    out.append(dict(SERVICE="codecommit", RESOURCE_TYPE="Repository", RESOURCE_ID=name,
+                                    RESOURCE_ARN=arn, RESOURCE_NAME=name, REGION=region, TAGS=""))
+        except Exception as e:
+            record_error(errors, f"codecommit({region}) list_repositories", e)
+    # CodeBuild
+    ccb = safe_client("codebuild", region)
+    if ccb:
+        try:
+            pg = ccb.get_paginator("list_projects")
+            for page in pg.paginate():
+                for name in page.get("projects", []):
+                    out.append(dict(SERVICE="codebuild", RESOURCE_TYPE="Project", RESOURCE_ID=name,
+                                    RESOURCE_ARN=f"arn:aws:codebuild:{region}:{account}:project/{name}",
+                                    RESOURCE_NAME=name, REGION=region, TAGS=""))
+        except Exception as e:
+            record_error(errors, f"codebuild({region}) list_projects", e)
+    # CodePipeline
+    ccp = safe_client("codepipeline", region)
+    if ccp:
+        try:
+            pg = ccp.get_paginator("list_pipelines")
+            for page in pg.paginate():
+                for p in page.get("pipelines", []):
+                    name = p.get("name","")
+                    out.append(dict(SERVICE="codepipeline", RESOURCE_TYPE="Pipeline", RESOURCE_ID=name,
+                                    RESOURCE_ARN=f"arn:aws:codepipeline:{region}:{account}:{name}",
+                                    RESOURCE_NAME=name, REGION=region, TAGS=""))
+        except Exception as e:
+            record_error(errors, f"codepipeline({region}) list_pipelines", e)
+    return out
+
+def collect_kinesis(region, account, errors):
+    out = []
+    c = safe_client("kinesis", region)
+    if not c: return out
+    try:
+        pg = c.get_paginator("list_streams")
+        for page in pg.paginate():
+            for name in page.get("StreamNames", []):
+                out.append(dict(SERVICE="kinesis", RESOURCE_TYPE="Stream", RESOURCE_ID=name,
+                                RESOURCE_ARN=f"arn:aws:kinesis:{region}:{account}:stream/{name}",
+                                RESOURCE_NAME=name, REGION=region, TAGS=""))
+    except Exception as e:
+        record_error(errors, f"kinesis({region}) list_streams", e)
+    return out
+
+def collect_eventsbridge(region, account, errors):
+    out = []
+    c = safe_client("events", region)
+    if not c: return out
+    try:
+        pg = c.get_paginator("list_event_buses")
+        for page in pg.paginate():
+            for eb in page.get("EventBuses", []):
+                name = eb.get("Name","")
+                arn = eb.get("Arn","")
+                out.append(dict(SERVICE="events", RESOURCE_TYPE="EventBus", RESOURCE_ID=name,
+                                RESOURCE_ARN=arn or f"arn:aws:events:{region}:{account}:event-bus/{name}",
+                                RESOURCE_NAME=name, REGION=region, TAGS=""))
+    except Exception as e:
+        record_error(errors, f"events({region}) list_event_buses", e)
+    return out
+
+def collect_elbv1_v2(region, account, errors):
+    # helper to run both ELBv1 and v2
+    return collect_elb(region, account, errors) + collect_elbv2(region, account, errors)
+
+# ------------------ Orchestration ------------------
+
+REGIONAL_COLLECTORS = {
+    "ec2": collect_ec2,
+    "elbv2": collect_elbv2,
+    "elb": collect_elb,
+    "rds": collect_rds,
+    "lambda": collect_lambda,
+    "cloudwatch": collect_logs,
+    "kms": collect_kms,
+    "eks": collect_eks,
+    "ecr": collect_ecr,
+    "ecs": collect_ecs,
+    "dynamodb": collect_dynamodb,
+    "cloudtrail": collect_cloudtrail,
+    "apigateway": lambda r,a,e: collect_apigw(r,a,e),   # v1+v2 inside
+    "acm": collect_acm,
+    "cloudformation": collect_cloudformation,
+    "elasticache": collect_elasticache,
+    "redshift": collect_redshift,
+    "redshift-serverless": collect_redshift_serverless,
+    "glue": collect_glue,
+    "code*": collect_code_family,       # codecommit, codebuild, codepipeline
+    "kinesis": collect_kinesis,
+    "events": collect_eventsbridge,
+}
+
+GLOBAL_COLLECTORS = {
+    "s3": collect_s3_global,
+    "iam": collect_iam_global,
+    "cloudfront": collect_cloudfront_global,
+    "route53": collect_route53_global,
+    "route53domains": collect_route53domains_global,
+}
+
+def build_summary(rows):
+    per_service = Counter()
+    per_service_type = defaultdict(Counter)
+    per_region = Counter()
+    for r in rows:
+        svc = r["SERVICE"]
+        typ = r["RESOURCE_TYPE"]
+        reg = r["REGION"]
+        per_service[svc] += 1
+        per_service_type[svc][typ] += 1
+        per_region[reg] += 1
+
+    out_rows = []
+    grand = sum(per_service.values())
+    out_rows.append({"SECTION": "GrandTotal", "KEY": "AllResources", "VALUE": grand})
+    for svc, cnt in sorted(per_service.items()):
+        out_rows.append({"SECTION": "ByService", "KEY": svc, "VALUE": cnt})
+        for typ, c in sorted(per_service_type[svc].items()):
+            out_rows.append({"SECTION": f"ByServiceType:{svc}", "KEY": typ, "VALUE": c})
+    for reg, cnt in sorted(per_region.items()):
+        out_rows.append({"SECTION": "ByRegion", "KEY": reg, "VALUE": cnt})
+    return out_rows, per_service, per_service_type, per_region, grand
+
+def print_cli_tables(per_service, per_service_type, per_region, grand, errors):
+    print("\n=== INVENTORY SUMMARY ===")
+    print_table_div()
+    print(f"{'Service':20} {'Total':>10}")
+    print_table_div()
+    for svc, cnt in sorted(per_service.items()):
+        print(f"{svc:20} {cnt:10d}")
+    print_table_div()
+    print(f"{'GRAND TOTAL':20} {grand:10d}")
+
+    print("\n--- Per Service : Resource Types ---")
+    for svc in sorted(per_service_type.keys()):
+        print(f"\n[{svc}]")
+        print_table_div()
+        print(f"{'ResourceType':30} {'Count':>10}")
+        print_table_div()
+        for typ, c in sorted(per_service_type[svc].items()):
+            print(f"{typ:30} {c:10d}")
+
+    print("\n--- Per Region Totals ---")
+    print_table_div()
+    print(f"{'Region':20} {'Total':>10}")
+    print_table_div()
+    for reg, cnt in sorted(per_region.items()):
+        print(f"{reg:20} {cnt:10d}")
+    print_table_div()
+
+    if errors:
+        print("\n=== ERRORS SUMMARY (summarized) ===")
+        for e in errors:
+            print(f"- {e}")
+
+def parse_args():
+    ap = argparse.ArgumentParser(description="AWS Full Inventory (Prowler-like, tagged+untagged) with ARNs")
+    ap.add_argument("--regions", default="", help="Comma-separated regions (default: all enabled)")
+    ap.add_argument("--services", default="", help="Comma-separated services; use 'all' for all (default: all)")
+    ap.add_argument("--out", default="./aws_inventory_output", help="Output folder")
+    return ap.parse_args()
+
+def main():
+    args = parse_args()
+    outdir = ensure_dir(args.out)
+
+    account = get_account_id()
+    print(f"Account: {account}")
+
+    regions = [r.strip() for r in args.regions.split(",") if r.strip()] or get_enabled_regions()
+    if not regions:
+        print("[WARN] No enabled regions discovered; proceeding with only global services.")
+
+    default_services = list(GLOBAL_COLLECTORS.keys()) + list(REGIONAL_COLLECTORS.keys())
+    if args.services.strip() and args.services.strip().lower() != "all":
+        wanted = [s.strip().lower() for s in args.services.split(",") if s.strip()]
+    else:
+        wanted = default_services
+
+    reg_wanted = [s for s in wanted if s in REGIONAL_COLLECTORS or s == "code*"]
+    glob_wanted = [s for s in wanted if s in GLOBAL_COLLECTORS]
+
+    print(f"Regions: {regions or '[]'}")
+    print(f"Services (regional): {reg_wanted}")
+    print(f"Services (global):   {glob_wanted}")
+
+    errors = []
+    rows = []
+
+    # Regional
+    for region in regions:
+        for svc in reg_wanted:
+            collector = REGIONAL_COLLECTORS[svc]
+            print(f"Collecting {svc} in {region} ...")
+            try:
+                part = collector(region, account, errors)
+                rows.extend(part)
+                print(f"  -> {len(part)} items")
+            except EndpointConnectionError as e:
+                record_error(errors, f"{svc}({region}) endpoint", e)
+            except ClientError as e:
+                record_error(errors, f"{svc}({region})", e)
+            except Exception as e:
+                record_error(errors, f"{svc}({region}) unexpected", e)
+
+    # Global
+    for svc in glob_wanted:
+        collector = GLOBAL_COLLECTORS[svc]
+        print(f"Collecting global {svc} ...")
+        try:
+            part = collector(account, errors)
+            rows.extend(part)
+            print(f"  -> {len(part)} items")
+        except ClientError as e:
+            record_error(errors, f"{svc}(global)", e)
+        except Exception as e:
+            record_error(errors, f"{svc}(global) unexpected", e)
+
+    # Finalize: write files
+    ts = now_iso()
+    detail_path = os.path.join(outdir, f"inventory_{account}_{ts}.csv")
+    header = ["ACCOUNT_ID","REGION","SERVICE","RESOURCE_TYPE","RESOURCE_ID","RESOURCE_ARN","RESOURCE_NAME","TAGS"]
+    # Normalize row keys
+    norm_rows = []
+    for r in rows:
+        norm_rows.append({
+            "ACCOUNT_ID": account,
+            "REGION": r.get("REGION",""),
+            "SERVICE": r.get("SERVICE",""),
+            "RESOURCE_TYPE": r.get("RESOURCE_TYPE",""),
+            "RESOURCE_ID": r.get("RESOURCE_ID",""),
+            "RESOURCE_ARN": r.get("RESOURCE_ARN",""),
+            "RESOURCE_NAME": r.get("RESOURCE_NAME",""),
+            "TAGS": r.get("TAGS",""),
+        })
+    write_csv(detail_path, header, norm_rows)
+    print(f"\nDetailed CSV: {detail_path}  (rows: {len(norm_rows)})")
+
+    # Summary
+    summary_rows, per_service, per_service_type, per_region, grand = build_summary(norm_rows)
+    summary_path = os.path.join(outdir, f"summary_{account}_{ts}.csv")
+    write_csv(summary_path, ["SECTION","KEY","VALUE"], summary_rows)
+    print(f"Summary CSV:  {summary_path}")
+
+    # Excel
+    xlsx_path = os.path.join(outdir, f"inventory_{account}_{ts}.xlsx")
+    ok, msg = write_excel(norm_rows, summary_rows, xlsx_path)
+    if msg:
+        print(msg)
+
+    # CLI tables + errors summary
+    print_cli_tables(per_service, per_service_type, per_region, grand, errors)
+
+    print("\nDone.")
+
+if __name__ == "__main__":
+    main()
