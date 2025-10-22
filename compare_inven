@@ -2,22 +2,23 @@
 # -*- coding: utf-8 -*-
 
 """
-Compare Prowler Quick Inventory CSVs (ARN-only logic):
+Compare Prowler Quick Inventory CSVs (ARN-only, hardened):
 
-- Union of per-region CSVs (deduped strictly by resource_arn, case-insensitive)
+- Union of per-region CSVs (deduped strictly by resource_arn, after aggressive sanitization)
   vs each ALL-regions CSV.
-- If resource_arn is blank in any file, that row is excluded from matching
-  and the entire line is logged in summary.txt.
-- Writes a single, human-readable summary.txt with:
+- If resource_arn is blank in any file, the whole row is excluded from matching
+  and logged verbatim into summary.txt.
+- Writes a human-readable summary.txt with:
     * total files checked
-    * per-file raw line counts & unique ARN counts
-    * every ARN-missing row (full line) per file
+    * per-file raw line counts & unique ARNs (by sanitized ARN)
+    * all ARN-missing rows (full line) per file
     * per ALL file: counts (per_union_unique, all_unique, matched, missing_in_all, extra_in_all)
-    * totals across ALL files (note: sums may double-count if ALL files overlap)
-- Writes Missing/Extra as CSV and TXT (for visibility).
+    * totals across ALL files (note: sums may double-count snapshots)
+- Writes Missing/Extra as CSV and TXT (readable tables)
+- Adds "NEAR MATCHES" hints in each diff__*.txt to highlight likely formatting mismatches.
 
-Columns expected (any order/sep; header names tolerant):
-  Account, Region, partition, service, resource type, resource id, resource arn, aws tags
+Columns tolerated in any order/sep (case/space/punctuation tolerant):
+  Account, Region, partition, service, resource type, resource id, resource arn (incl. AWS_ResourceARN), aws tags
 
 ================== CONFIGURE HERE ==================
 """
@@ -30,26 +31,29 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-# ---------- CONFIG: hardcode folders here ----------
+# ---------- CONFIG: set your folders here ----------
 ALL_INPUT       = r"./inventory/all"          # File OR folder containing ALL-regions CSV(s)
 PER_REGION_ROOT = r"./inventory/per_region"   # Folder with per-region CSVs (flat or subfolders)
 OUTPUT_DIR      = r"./compare_out"            # Where summary + diffs will be written
-FILENAME_FILTER = "prowler"                   # Only consider CSVs whose name contains this ("" = include all)
+FILENAME_FILTER = "prowler"                   # Only consider CSVs whose filename contains this ("" = include all)
 ALL_MODE        = "each"                      # If ALL_INPUT is a folder: "latest" or "each"
+NEAR_MATCH_MAX  = 3                           # Max suggestions per missing ARN in diff__*.txt
 # ---------------------------------------------------
 
-# You can ignore CLI and rely on the CONFIG above; CLI just overrides if provided.
+# ===== CLI (optional — you can rely on CONFIG above) =====
 def parse_args():
-    p = argparse.ArgumentParser("Compare Prowler Quick Inventory (ARN-only) — per-region union vs ALL-regions.")
+    p = argparse.ArgumentParser("Compare Prowler Quick Inventory (ARN-only, hardened).")
     p.add_argument("--all", default=ALL_INPUT, help="Path to ALL CSV file OR a folder containing ALL CSVs.")
     p.add_argument("--per-root", default=PER_REGION_ROOT, help="Root folder with per-region CSVs.")
     p.add_argument("--output", default=OUTPUT_DIR, help="Output folder for reports (summary + diffs).")
     p.add_argument("--filter", default=FILENAME_FILTER, help="Only consider CSVs whose filenames contain this string.")
     p.add_argument("--all-mode", choices=["latest","each"], default=ALL_MODE,
                    help="If --all is a folder: 'latest' picks newest CSV; 'each' compares every CSV in that folder.")
+    p.add_argument("--near-match-max", type=int, default=NEAR_MATCH_MAX,
+                   help="Max near-match suggestions per missing ARN in diff__*.txt.")
     return p.parse_args()
 
-# ---------- CSV helpers ----------
+# ===== CSV helpers =====
 def detect_sep(csv_path: Path) -> str:
     with open(csv_path, "r", encoding="utf-8", errors="replace") as f:
         head = f.readline()
@@ -72,28 +76,71 @@ def load_csv_with_headers(path: Path) -> Tuple[List[Dict[str,str]], List[str]]:
         rdr = csv.DictReader(f, delimiter=sep)
         rows = []
         for r in rdr:
-            # Keep original header keys and values; DictReader preserves header order
             rows.append({k: (v or "").strip() for k, v in r.items()})
         return rows, (rdr.fieldnames or [])
 
-def norm_header(h: str) -> str:
-    return re.sub(r"[^a-z0-9]+", "_", (h or "").strip().lower())
+# ===== Normalization & ARN handling =====
+# Invisible chars that commonly sneak into CSVs (NBSP, zero-width, BOM, LRM/RLM, word-joiner)
+INVIS_RE = re.compile(r"[\u00A0\u200B-\u200D\u200E\u200F\u202A-\u202E\u2060\uFEFF]")
 
-def row_get_arn_normed(row: Dict[str,str]) -> str:
-    """Find ARN regardless of header style; return as-is (not lowercased)."""
-    # Try common header spellings:
-    for cand in ["resource_arn", "resource arn", "arn"]:
-        for k in row.keys():
-            if norm_header(k) == norm_header(cand):
+def strip_invis(s: str) -> str:
+    return INVIS_RE.sub("", s or "")
+
+def norm_header(h: str) -> str:
+    # Remove invisibles, lower, collapse non-alnum to underscore
+    return re.sub(r"[^a-z0-9]+", "_", strip_invis(h).strip().lower())
+
+def find_arn_value(row: Dict[str,str]) -> str:
+    """
+    Robustly locate the ARN column:
+      - exact patterns: resource_arn, resource arn, arn, AWS_ResourceARN
+      - any header whose normalized form CONTAINS 'resourcearn'
+      - any header whose normalized form ENDS WITH 'arn'
+    """
+    if not row:
+        return ""
+    # First pass: common names
+    candidates = ["resource_arn", "resource arn", "arn", "AWS_ResourceARN"]
+    norm_map = {k: norm_header(k) for k in row.keys()}
+    for want in candidates:
+        nw = norm_header(want)
+        for k, nk in norm_map.items():
+            if nk == nw:
                 return row.get(k, "")
-    # If nothing matched, try any column whose name ends with 'arn'
-    for k in row.keys():
-        if norm_header(k).endswith("arn"):
+    # Second pass: contains 'resourcearn'
+    for k, nk in norm_map.items():
+        if "resourcearn" in nk:
+            return row.get(k, "")
+    # Third pass: endswith 'arn'
+    for k, nk in norm_map.items():
+        if nk.endswith("arn"):
             return row.get(k, "")
     return ""
 
+def sanitize_arn(raw: str) -> str:
+    """
+    Aggressively sanitize an ARN for matching:
+      - strip invisibles & surrounding quotes
+      - strip all whitespace characters
+      - lower-case
+      - normalize S3 bucket ARNs by removing a single trailing '/'
+    """
+    s = strip_invis((raw or "").strip())
+    # strip outer quotes
+    if (s.startswith('"') and s.endswith('"')) or (s.startswith("'") and s.endswith("'")):
+        s = s[1:-1].strip()
+    # remove all whitespace chars (spaces, tabs)
+    s = re.sub(r"\s+", "", s)
+    s = s.lower()
+
+    # normalize s3 bucket arns: arn:aws:s3:::bucket/  -> arn:aws:s3:::bucket
+    if s.startswith("arn:aws:s3:::") and s.endswith("/") and s.count("/") == 3:
+        s = s[:-1]
+    return s
+
+# Map to canonical output schema for reporting
+OUT_HEADER = ["account","region","partition","service","resource_type","resource_id","resource_arn","aws_tags"]
 def to_schema(row: Dict[str,str]) -> Dict[str,str]:
-    """Map to consistent output schema using original keys (case-insensitive)."""
     def pick(*names: str) -> str:
         for n in names:
             for k in row.keys():
@@ -107,24 +154,22 @@ def to_schema(row: Dict[str,str]) -> Dict[str,str]:
         "service":      pick("service", "service_name"),
         "resource_type":pick("resource_type", "type", "resource type"),
         "resource_id":  pick("resource_id", "resource id", "id", "name", "resource_name"),
-        "resource_arn": pick("resource_arn", "resource arn", "arn"),
+        "resource_arn": pick("resource_arn", "resource arn", "arn", "AWS_ResourceARN"),
         "aws_tags":     pick("aws_tags", "tags"),
     }
 
 def row_to_kv_line(row: Dict[str,str], field_order: List[str]) -> str:
-    """Render an entire CSV row as 'col=value | col=value ...' using original header order."""
     parts = []
     for h in field_order:
         val = (row.get(h, "") or "").replace("\n", " ").replace("\r", " ")
         parts.append(f"{h}={val}")
-    # Add any columns not in field_order (if any)
     for k in row.keys():
         if k not in field_order:
             val = (row.get(k, "") or "").replace("\n", " ").replace("\r", " ")
             parts.append(f"{k}={val}")
     return " | ".join(parts)
 
-# ---------- Output helpers ----------
+# ===== Output helpers =====
 def ensure_dirs(base: Path) -> Dict[str, Path]:
     d = {"root": base, "reports": base / "reports"}
     for v in d.values(): v.mkdir(parents=True, exist_ok=True)
@@ -153,7 +198,14 @@ def write_txt_table(fh, header: List[str], rows: List[List[str]]):
         write_txt_line(fh, "| " + " | ".join(str(cell).ljust(widths[i]) for i, cell in enumerate(row)) + " |")
     write_txt_line(fh, sep)
 
-# ---------- Ingest per-region (ARN-only) ----------
+def rows_to_txt_block(rows: List[Dict[str,str]], extra_cols: List[str]=None) -> Tuple[List[str], List[List[str]]]:
+    cols = OUT_HEADER + (extra_cols or [])
+    table_rows = []
+    for r in rows:
+        table_rows.append([r.get(c,"") for c in cols])
+    return cols, table_rows
+
+# ===== Ingest per-region (ARN-only) =====
 def list_per_region_csvs(per_root: Path, name_filter: str) -> List[Path]:
     out = []
     for p in per_root.rglob("*.csv"):
@@ -167,9 +219,10 @@ def list_per_region_csvs(per_root: Path, name_filter: str) -> List[Path]:
 def build_per_union(per_root: Path, name_filter: str):
     """
     Returns:
-      per_union_rows: list of normalized rows (schema) for unique ARNs
-      per_files_stats: list of dicts with per-file counts
-      arn_missing_log: list of dicts {source_file, lines: [<full-line>, ...]}
+      per_union_rows: list[dict] of normalized rows for unique sanitized ARNs (provenance _source_file)
+      per_files_stats: list of per-file counters
+      arn_missing_log: [{source_file, lines:[str,...]}]
+      per_files: list of included file Paths
     """
     per_files = list_per_region_csvs(per_root, name_filter)
     union_by_arn: Dict[str, Dict[str,str]] = {}
@@ -184,17 +237,19 @@ def build_per_union(per_root: Path, name_filter: str):
         arn_missing_lines: List[str] = []
 
         for raw in rows_raw:
-            arn = row_get_arn_normed(raw).strip()
-            if not arn:
+            arn_raw = find_arn_value(raw)
+            if not arn_raw or not arn_raw.strip():
                 arn_missing_lines.append(row_to_kv_line(raw, field_order))
                 continue
-            arn_key = arn.lower()
+            arn_key = sanitize_arn(arn_raw)
+            if not arn_key:
+                arn_missing_lines.append(row_to_kv_line(raw, field_order))
+                continue
             if arn_key not in seen_arns_in_file:
                 seen_arns_in_file.add(arn_key)
                 unique_arn_in_file += 1
             if arn_key not in union_by_arn:
                 row_std = to_schema(raw)
-                # provenance
                 row_std["_source_file"] = f.name
                 union_by_arn[arn_key] = row_std
 
@@ -209,7 +264,7 @@ def build_per_union(per_root: Path, name_filter: str):
 
     return list(union_by_arn.values()), per_files_stats, arn_missing_log, per_files
 
-# ---------- Ingest ALL files (ARN-only) ----------
+# ===== Ingest ALL files (ARN-only) =====
 def resolve_all_csvs(all_input: Path, name_filter: str, mode: str) -> List[Path]:
     if all_input.is_file():
         return [all_input]
@@ -220,68 +275,107 @@ def resolve_all_csvs(all_input: Path, name_filter: str, mode: str) -> List[Path]
         return list_csvs(all_input, name_filter)
     return []
 
-def dedupe_all_by_arn(rows_raw: List[Dict[str,str]], src_name: str) -> Tuple[List[Dict[str,str]], int, List[str]]:
+def dedupe_all_by_arn(rows_raw: List[Dict[str,str]]) -> Tuple[List[Dict[str,str]], int, List[str], List[str]]:
     """
     Return:
-      all_unique_rows (by ARN only),
+      all_unique_rows (by sanitized ARN),
       rows_read_count,
-      arn_missing_lines (full-line strings)
+      arn_missing_lines (full-line strings),
+      all_arns_sanitized (list of sanitized arns from ALL file for near-match search)
     """
-    # For ARN-missing logging, we need original header order:
-    # Reload with headers (we already have raw as orig maps).
-    # Here, rows_raw are original maps already.
     rows_read = len(rows_raw)
     uniq_by_arn: Dict[str, Dict[str,str]] = {}
     arn_missing_lines: List[str] = []
+    all_sanitized_arns: List[str] = []
 
-    # Capture header order from first row
     field_order = list(rows_raw[0].keys()) if rows_raw else []
 
     for raw in rows_raw:
-        arn = row_get_arn_normed(raw).strip()
-        if not arn:
+        arn_raw = find_arn_value(raw)
+        if not arn_raw or not arn_raw.strip():
             arn_missing_lines.append(row_to_kv_line(raw, field_order))
             continue
-        arn_key = arn.lower()
+        arn_key = sanitize_arn(arn_raw)
+        if not arn_key:
+            arn_missing_lines.append(row_to_kv_line(raw, field_order))
+            continue
         if arn_key not in uniq_by_arn:
             uniq_by_arn[arn_key] = to_schema(raw)
+        all_sanitized_arns.append(arn_key)
 
-    return list(uniq_by_arn.values()), rows_read, arn_missing_lines
+    return list(uniq_by_arn.values()), rows_read, arn_missing_lines, all_sanitized_arns
 
-# ---------- Diff & reporting ----------
-OUT_HEADER = ["account","region","partition","service","resource_type","resource_id","resource_arn","aws_tags"]
+# ===== Diff & near-match =====
+def find_near_matches(missing_arn_key: str, all_arn_keys: List[str], max_hits: int = 3) -> List[str]:
+    """
+    Heuristic near-match finder for diagnostics (not used for matching logic):
+      - exact with/without single trailing '/': s or s + '/'
+      - same tail token (after last ':' or '/' in ARN resource part)
+      - contains-substring match (case-insensitive) for a middle token
+    Returns list of ARN strings (sanitized form) from the ALL file.
+    """
+    hits: List[str] = []
 
-def rows_to_txt_block(rows: List[Dict[str,str]], extra_cols: List[str]=None) -> Tuple[List[str], List[List[str]]]:
-    cols = OUT_HEADER + (extra_cols or [])
-    table_rows = []
-    for r in rows:
-        table_rows.append([r.get(c,"") for c in cols])
-    return cols, table_rows
+    # variant: with/without trailing slash
+    if missing_arn_key.endswith("/"):
+        alt = missing_arn_key[:-1]
+    else:
+        alt = missing_arn_key + "/"
+    if alt in all_arn_keys:
+        hits.append(alt)
+        if len(hits) >= max_hits:
+            return hits
+
+    # extract a tail token from resource part
+    # arn:part:svc:region:acct:resource
+    parts = missing_arn_key.split(":", 5)
+    resource = parts[5] if len(parts) >= 6 else ""
+    tail = resource.split("/")[-1].split(":")[-1]
+    if tail and len(tail) >= 3:
+        for cand in all_arn_keys:
+            if tail in cand:
+                if cand not in hits:
+                    hits.append(cand)
+                    if len(hits) >= max_hits:
+                        return hits
+
+    # broad substring (only if still nothing)
+    mid = tail or (resource[:20] if resource else missing_arn_key[:20])
+    if mid:
+        for cand in all_arn_keys:
+            if mid in cand:
+                if cand not in hits:
+                    hits.append(cand)
+                    if len(hits) >= max_hits:
+                        return hits
+
+    return hits
 
 def write_diff_files(per_union: List[Dict[str,str]],
                      all_rows: List[Dict[str,str]],
                      all_file_name: str,
-                     out_reports: Path) -> Dict[str,int]:
-    # Sets by ARN only
-    per_arns = { (r.get("resource_arn","") or "").lower() for r in per_union if r.get("resource_arn") }
-    all_arns = { (r.get("resource_arn","") or "").lower() for r in all_rows if r.get("resource_arn") }
+                     out_reports: Path,
+                     all_sanitized_arns: List[str],
+                     near_match_max: int) -> Dict[str,int]:
+    # Sets by sanitized ARN only
+    per_arns = { sanitize_arn(r.get("resource_arn","")) for r in per_union if r.get("resource_arn") }
+    all_arns = { sanitize_arn(r.get("resource_arn","")) for r in all_rows if r.get("resource_arn") }
     inter = per_arns & all_arns
 
-    # Build dicts by arn for easy lookup
-    per_by_arn = { (r["resource_arn"] or "").lower(): r for r in per_union if r.get("resource_arn") }
-    all_by_arn = { (r["resource_arn"] or "").lower(): r for r in all_rows if r.get("resource_arn") }
+    # Dicts by arn for reporting
+    per_by_arn = { sanitize_arn(r["resource_arn"]): r for r in per_union if r.get("resource_arn") }
+    all_by_arn = { sanitize_arn(r["resource_arn"]): r for r in all_rows if r.get("resource_arn") }
 
-    # Missing: in per but not in all
+    # Missing & Extra
     missing = []
-    for arn in sorted(per_arns - all_arns):
-        r = dict(per_by_arn[arn])
+    for arn_key in sorted(per_arns - all_arns):
+        r = dict(per_by_arn[arn_key])
         r["source_file"] = r.pop("_source_file", r.get("source_file",""))
         missing.append(r)
 
-    # Extra: in all but not in per
     extra = []
-    for arn in sorted(all_arns - per_arns):
-        r = dict(all_by_arn[arn])
+    for arn_key in sorted(all_arns - per_arns):
+        r = dict(all_by_arn[arn_key])
         r["source_all_file"] = all_file_name
         extra.append(r)
 
@@ -292,7 +386,7 @@ def write_diff_files(per_union: List[Dict[str,str]],
     write_csv(missing_csv, missing, OUT_HEADER + ["source_file"])
     write_csv(extra_csv,   extra,   OUT_HEADER + ["source_all_file"])
 
-    # Write TXT tables (visibility)
+    # Write TXT with near-match hints
     diff_txt = out_reports / f"diff__{stem}.txt"
     with open(diff_txt, "w", encoding="utf-8") as fh:
         write_txt_line(fh, f"DIFF for ALL file: {all_file_name}")
@@ -304,6 +398,18 @@ def write_diff_files(per_union: List[Dict[str,str]],
         if missing:
             header, rows = rows_to_txt_block(missing, ["source_file"])
             write_txt_table(fh, header, rows)
+            write_txt_line(fh, "")
+            # Near matches
+            write_txt_line(fh, "[NEAR MATCH HINTS for missing ARNs]")
+            for m in missing:
+                mk = sanitize_arn(m.get("resource_arn",""))
+                hints = find_near_matches(mk, all_sanitized_arns, max_hits=near_match_max)
+                if hints:
+                    write_txt_line(fh, f"  ARN: {m.get('resource_arn','')}  -> suggestions:")
+                    for h in hints:
+                        write_txt_line(fh, f"    {h}")
+                else:
+                    write_txt_line(fh, f"  ARN: {m.get('resource_arn','')}  -> no near matches found")
         else:
             write_txt_line(fh, "(none)")
         write_txt_line(fh, "")
@@ -324,10 +430,9 @@ def write_diff_files(per_union: List[Dict[str,str]],
         "extra_in_all": len(extra),
     }
 
-# ---------- Main ----------
+# ===== Main =====
 def main():
     args = parse_args()
-
     per_root = Path(args.per_root)
     all_input = Path(args.all)
     out_dirs = ensure_dirs(Path(args.output).resolve())
@@ -337,7 +442,7 @@ def main():
     if not all_input.exists():
         raise SystemExit(f"[ERROR] --all not found: {all_input}")
 
-    # Build per-region union (ARN-only)
+    # Build per-region union (ARN-only, sanitized)
     per_union, per_file_stats, per_arn_missing_log, per_files = build_per_union(per_root, args.filter)
 
     # Resolve ALL files
@@ -355,8 +460,8 @@ def main():
 
     for af in all_files:
         rows_raw, field_order = load_csv_with_headers(af)
-        all_unique_rows, all_rows_read, arn_missing_lines = dedupe_all_by_arn(rows_raw, af.name)
-        # Record line counts
+        all_unique_rows, all_rows_read, arn_missing_lines, all_sanitized_arns = dedupe_all_by_arn(rows_raw)
+
         all_file_line_stats.append({
             "all_file": af.name,
             "rows_read": all_rows_read,
@@ -366,15 +471,18 @@ def main():
         if arn_missing_lines:
             all_arn_missing_log.append({"all_file": af.name, "lines": arn_missing_lines})
 
-        # Diff + write missing/extra (CSV + TXT)
-        counts = write_diff_files(per_union, all_unique_rows, af.name, out_dirs["reports"])
+        counts = write_diff_files(
+            per_union, all_unique_rows, af.name, out_dirs["reports"],
+            all_sanitized_arns=all_sanitized_arns,
+            near_match_max=args.near_match_max
+        )
         counts["all_file"] = af.name
         all_file_counts.append(counts)
 
     # ===== summary.txt =====
     summary_txt = out_dirs["reports"] / "summary.txt"
     with open(summary_txt, "w", encoding="utf-8") as fh:
-        write_txt_line(fh, "Prowler Quick Inventory — ARN-only Comparison Summary")
+        write_txt_line(fh, "Prowler Quick Inventory — ARN-only Comparison Summary (hardened)")
         write_txt_line(fh, f"Generated: {datetime.utcnow().isoformat()}Z")
         write_txt_line(fh, "")
 
@@ -405,7 +513,7 @@ def main():
         write_txt_table(fh, cmp_header, cmp_rows)
         write_txt_line(fh, "")
 
-        # Totals across ALL files (note: sums may double-count across snapshots)
+        # Totals across ALL files (sums may double-count if snapshots overlap)
         total_per_union_once = all_file_counts[0]["per_union_unique"] if all_file_counts else 0
         sum_all_unique = sum(int(c["all_unique"]) for c in all_file_counts)
         sum_matched = sum(int(c["matched"]) for c in all_file_counts)
