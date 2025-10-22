@@ -2,21 +2,24 @@
 # -*- coding: utf-8 -*-
 
 """
-Compare Prowler Quick Inventory CSVs:
-- Union of per-region files vs each all-regions file (one or many).
-- Produce a clear, human-readable summary.txt with per-file line counts and all comparison counts.
-- Also produce missing/extra as CSV and as TXT for visibility.
+Compare Prowler Quick Inventory CSVs (ARN-only logic):
 
-Your CSV columns (any order/sep): 
-Account, Region, partition, service, resource type, resource id, resource arn, aws tags
+- Union of per-region CSVs (deduped strictly by resource_arn, case-insensitive)
+  vs each ALL-regions CSV.
+- If resource_arn is blank in any file, that row is excluded from matching
+  and the entire line is logged in summary.txt.
+- Writes a single, human-readable summary.txt with:
+    * total files checked
+    * per-file raw line counts & unique ARN counts
+    * every ARN-missing row (full line) per file
+    * per ALL file: counts (per_union_unique, all_unique, matched, missing_in_all, extra_in_all)
+    * totals across ALL files (note: sums may double-count if ALL files overlap)
+- Writes Missing/Extra as CSV and TXT (for visibility).
 
-Primary unique key = lowercased resource_arn; fallback only if ARN missing:
-Account|partition|Region|service|resource type|resource id  (text lowercased, id kept as-is)
+Columns expected (any order/sep; header names tolerant):
+  Account, Region, partition, service, resource type, resource id, resource arn, aws tags
 
-Globals (IAM etc.) are detected (blank/global region or ARN with empty region) but we only report counts;
-no percentages are included.
-
-======== CONFIGURE HERE ========
+================== CONFIGURE HERE ==================
 """
 
 from __future__ import annotations
@@ -27,52 +30,32 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-# ---------- CONFIG: hardcode your folders here ----------
-ALL_INPUT   = r"./inventory/all"         # File OR folder containing all-regions CSV(s)
-PER_ROOT    = r"./inventory/per_region"  # Folder with per-region CSVs (flat or in subfolders)
-OUTPUT_DIR  = r"./compare_out"           # Folder where summary + diffs will be written
-FILENAME_FILTER = "prowler"              # Consider only CSVs whose filename contains this ("" to include all)
-ALL_MODE    = "each"                     # If ALL_INPUT is a folder: "latest" or "each"
-# --------------------------------------------------------
+# ---------- CONFIG: hardcode folders here ----------
+ALL_INPUT       = r"./inventory/all"          # File OR folder containing ALL-regions CSV(s)
+PER_REGION_ROOT = r"./inventory/per_region"   # Folder with per-region CSVs (flat or subfolders)
+OUTPUT_DIR      = r"./compare_out"            # Where summary + diffs will be written
+FILENAME_FILTER = "prowler"                   # Only consider CSVs whose name contains this ("" = include all)
+ALL_MODE        = "each"                      # If ALL_INPUT is a folder: "latest" or "each"
+# ---------------------------------------------------
 
-# CLI passthrough (optional — you can ignore and rely on CONFIG above)
+# You can ignore CLI and rely on the CONFIG above; CLI just overrides if provided.
 def parse_args():
-    p = argparse.ArgumentParser("Compare Prowler Quick Inventory (per-region union vs all-regions).")
-    p.add_argument("--all", default=ALL_INPUT, help="Path to ALL-REGIONS CSV file OR a folder containing CSVs.")
-    p.add_argument("--per-root", default=PER_ROOT, help="Root folder with per-region CSVs (flat or subfolders).")
-    p.add_argument("--output", default=OUTPUT_DIR, help="Output folder for reports (summary/diffs).")
+    p = argparse.ArgumentParser("Compare Prowler Quick Inventory (ARN-only) — per-region union vs ALL-regions.")
+    p.add_argument("--all", default=ALL_INPUT, help="Path to ALL CSV file OR a folder containing ALL CSVs.")
+    p.add_argument("--per-root", default=PER_REGION_ROOT, help="Root folder with per-region CSVs.")
+    p.add_argument("--output", default=OUTPUT_DIR, help="Output folder for reports (summary + diffs).")
     p.add_argument("--filter", default=FILENAME_FILTER, help="Only consider CSVs whose filenames contain this string.")
     p.add_argument("--all-mode", choices=["latest","each"], default=ALL_MODE,
                    help="If --all is a folder: 'latest' picks newest CSV; 'each' compares every CSV in that folder.")
     return p.parse_args()
 
-# ---------- small IO helpers ----------
-def ensure_dirs(base: Path) -> Dict[str, Path]:
-    d = {
-        "root": base,
-        "reports": base / "reports",   # summary + txt/csv diffs here
-    }
-    for v in d.values(): v.mkdir(parents=True, exist_ok=True)
-    return d
-
+# ---------- CSV helpers ----------
 def detect_sep(csv_path: Path) -> str:
     with open(csv_path, "r", encoding="utf-8", errors="replace") as f:
         head = f.readline()
     if ";" in head and "," not in head:
         return ";"
     return ";" if head.count(";") >= head.count(",") else ","
-
-def norm_header(h: str) -> str:
-    return re.sub(r"[^a-z0-9]+", "_", h.strip().lower())
-
-def load_csv_rows(path: Path) -> List[Dict[str, str]]:
-    sep = detect_sep(path)
-    with open(path, "r", encoding="utf-8", errors="replace") as f:
-        rdr = csv.DictReader(f, delimiter=sep)
-        rows = []
-        for r in rdr:
-            rows.append({norm_header(k): (v or "").strip() for k, v in r.items()})
-        return rows
 
 def list_csvs(folder: Path, name_filter: str) -> List[Path]:
     cs = [p for p in folder.rglob("*.csv") if (name_filter in p.name) or (not name_filter)]
@@ -82,94 +65,95 @@ def newest_csv(folder: Path, name_filter: str) -> Optional[Path]:
     cs = list_csvs(folder, name_filter)
     return cs[-1] if cs else None
 
-def region_from_filename(name: str) -> str:
-    """
-    Best-effort region inference from tail token in filename.
-    Accepts hyphens/underscores; returns with hyphens.
-    E.g., foo_ap_south2.csv -> ap-south-2
-    """
-    base = Path(name).stem
-    token = re.split(r"[_-]", base)[-1]
-    token = token.replace("_", "-")
-    token = re.sub(r"^([a-z]+-[a-z]+)(\d)$", r"\1-\2", token)
-    return token
+def load_csv_with_headers(path: Path) -> Tuple[List[Dict[str,str]], List[str]]:
+    """Load CSV into list of dicts preserving original header names & order."""
+    sep = detect_sep(path)
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        rdr = csv.DictReader(f, delimiter=sep)
+        rows = []
+        for r in rdr:
+            # Keep original header keys and values; DictReader preserves header order
+            rows.append({k: (v or "").strip() for k, v in r.items()})
+        return rows, (rdr.fieldnames or [])
 
-# ---------- normalize to target schema ----------
-# Your columns:
-# Account, Region, partition, service, resource type, resource id, resource arn, aws tags
-COL_MAP = {
-    "account": ["account", "account_id"],
-    "region": ["region"],
-    "partition": ["partition"],
-    "service": ["service", "service_name"],
-    "resource_type": ["resource_type", "type", "resource type"],
-    "resource_id": ["resource_id", "id", "name", "resource id", "resource_name"],
-    "resource_arn": ["resource_arn", "arn", "resource arn"],
-    "aws_tags": ["aws_tags", "tags"],
-}
-OUT_HEADER = ["account","region","partition","service","resource_type","resource_id","resource_arn","aws_tags"]
+def norm_header(h: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", (h or "").strip().lower())
 
-def pick(row: Dict[str,str], keys: List[str]) -> str:
-    for k in keys:
-        k2 = norm_header(k)
-        if k2 in row and row[k2]:
-            return row[k2]
+def row_get_arn_normed(row: Dict[str,str]) -> str:
+    """Find ARN regardless of header style; return as-is (not lowercased)."""
+    # Try common header spellings:
+    for cand in ["resource_arn", "resource arn", "arn"]:
+        for k in row.keys():
+            if norm_header(k) == norm_header(cand):
+                return row.get(k, "")
+    # If nothing matched, try any column whose name ends with 'arn'
+    for k in row.keys():
+        if norm_header(k).endswith("arn"):
+            return row.get(k, "")
     return ""
 
 def to_schema(row: Dict[str,str]) -> Dict[str,str]:
+    """Map to consistent output schema using original keys (case-insensitive)."""
+    def pick(*names: str) -> str:
+        for n in names:
+            for k in row.keys():
+                if norm_header(k) == norm_header(n):
+                    return row.get(k, "")
+        return ""
     return {
-        "account": pick(row, COL_MAP["account"]),
-        "region": pick(row, COL_MAP["region"]),
-        "partition": pick(row, COL_MAP["partition"]),
-        "service": pick(row, COL_MAP["service"]),
-        "resource_type": pick(row, COL_MAP["resource_type"]),
-        "resource_id": pick(row, COL_MAP["resource_id"]),
-        "resource_arn": pick(row, COL_MAP["resource_arn"]),
-        "aws_tags": pick(row, COL_MAP["aws_tags"]),
+        "account":      pick("account", "account_id"),
+        "region":       pick("region"),
+        "partition":    pick("partition"),
+        "service":      pick("service", "service_name"),
+        "resource_type":pick("resource_type", "type", "resource type"),
+        "resource_id":  pick("resource_id", "resource id", "id", "name", "resource_name"),
+        "resource_arn": pick("resource_arn", "resource arn", "arn"),
+        "aws_tags":     pick("aws_tags", "tags"),
     }
 
-def arn_region(arn: str) -> str:
-    # arn:partition:service:region:account-id:resource
-    try:
-        parts = arn.split(":", 5)
-        return parts[3] if len(parts) >= 6 else ""
-    except Exception:
-        return ""
+def row_to_kv_line(row: Dict[str,str], field_order: List[str]) -> str:
+    """Render an entire CSV row as 'col=value | col=value ...' using original header order."""
+    parts = []
+    for h in field_order:
+        val = (row.get(h, "") or "").replace("\n", " ").replace("\r", " ")
+        parts.append(f"{h}={val}")
+    # Add any columns not in field_order (if any)
+    for k in row.keys():
+        if k not in field_order:
+            val = (row.get(k, "") or "").replace("\n", " ").replace("\r", " ")
+            parts.append(f"{k}={val}")
+    return " | ".join(parts)
 
-def is_global(r: Dict[str,str]) -> bool:
-    reg = (r.get("region") or "").strip().lower()
-    if reg in {"", "global", "aws-global"}:
-        return True
-    arn = (r.get("resource_arn") or "").strip()
-    if arn and arn_region(arn) == "":
-        return True
-    return False
+# ---------- Output helpers ----------
+def ensure_dirs(base: Path) -> Dict[str, Path]:
+    d = {"root": base, "reports": base / "reports"}
+    for v in d.values(): v.mkdir(parents=True, exist_ok=True)
+    return d
 
-def build_key(r: Dict[str,str]) -> str:
-    arn = (r.get("resource_arn") or "").strip()
-    if arn:
-        return arn.lower()
-    account = (r.get("account") or "").strip().lower()
-    part    = (r.get("partition") or "").strip().lower()
-    reg     = (r.get("region") or "").strip().lower()
-    svc     = (r.get("service") or "").strip().lower()
-    rtype   = (r.get("resource_type") or "").strip().lower()
-    rid     = (r.get("resource_id") or "").strip()
-    return f"{account}|{part}|{reg}|{svc}|{rtype}|{rid}"
+def write_csv(path: Path, rows: List[Dict[str,str]], header: List[str]):
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=header)
+        w.writeheader()
+        for r in rows:
+            w.writerow({k: r.get(k, "") for k in header})
 
-def fill_region_if_missing(r: Dict[str,str], filename: str) -> None:
-    if (r.get("region") or "").strip():
-        return
-    arn = (r.get("resource_arn") or "").strip()
-    reg = arn_region(arn)
-    if reg:
-        r["region"] = reg
-    else:
-        guess = region_from_filename(filename)
-        if re.match(r"^[a-z]{2,}-[a-z]+-\d+$", guess):
-            r["region"] = guess
+def write_txt_line(fh, text: str=""):
+    fh.write(text + "\n")
 
-# ---------- ingest per-region ----------
+def write_txt_table(fh, header: List[str], rows: List[List[str]]):
+    widths = [len(h) for h in header]
+    for row in rows:
+        for i, cell in enumerate(row):
+            widths[i] = max(widths[i], len(str(cell)))
+    sep = "+".join("-"*(w+2) for w in widths)
+    write_txt_line(fh, sep)
+    write_txt_line(fh, "| " + " | ".join(h.ljust(widths[i]) for i, h in enumerate(header)) + " |")
+    write_txt_line(fh, sep)
+    for row in rows:
+        write_txt_line(fh, "| " + " | ".join(str(cell).ljust(widths[i]) for i, cell in enumerate(row)) + " |")
+    write_txt_line(fh, sep)
+
+# ---------- Ingest per-region (ARN-only) ----------
 def list_per_region_csvs(per_root: Path, name_filter: str) -> List[Path]:
     out = []
     for p in per_root.rglob("*.csv"):
@@ -180,54 +164,52 @@ def list_per_region_csvs(per_root: Path, name_filter: str) -> List[Path]:
         out.append(p)
     return sorted(out, key=lambda p: p.stat().st_mtime)
 
-def gather_per_union(per_root: Path, name_filter: str) -> Tuple[List[Dict[str,str]], List[Dict[str,str]]]:
+def build_per_union(per_root: Path, name_filter: str):
     """
     Returns:
-      per_union (unique rows, with provenance _source_region/_source_file)
-      per_file_stats (rows_read, unique_in_file, globals_in_file, arn_missing_in_file)
+      per_union_rows: list of normalized rows (schema) for unique ARNs
+      per_files_stats: list of dicts with per-file counts
+      arn_missing_log: list of dicts {source_file, lines: [<full-line>, ...]}
     """
-    files = list_per_region_csvs(per_root, name_filter)
-    per_union_dict: Dict[str, Dict[str,str]] = {}
-    per_file_stats: List[Dict[str,str]] = []
+    per_files = list_per_region_csvs(per_root, name_filter)
+    union_by_arn: Dict[str, Dict[str,str]] = {}
+    per_files_stats: List[Dict[str, str|int]] = []
+    arn_missing_log: List[Dict[str, object]] = []
 
-    for f in files:
-        rows_raw = load_csv_rows(f)
+    for f in per_files:
+        rows_raw, field_order = load_csv_with_headers(f)
         rows_read = len(rows_raw)
-        uniq_in_file = 0
-        globals_in_file = 0
-        arn_missing = 0
-        seen_keys_file = set()
+        unique_arn_in_file = 0
+        seen_arns_in_file = set()
+        arn_missing_lines: List[str] = []
 
         for raw in rows_raw:
-            r = to_schema(raw)
-            fill_region_if_missing(r, f.name)
-            k = build_key(r)
-            if not k:
-                if not r.get("resource_arn"):
-                    arn_missing += 1
+            arn = row_get_arn_normed(raw).strip()
+            if not arn:
+                arn_missing_lines.append(row_to_kv_line(raw, field_order))
                 continue
-            if k not in seen_keys_file:
-                seen_keys_file.add(k)
-                uniq_in_file += 1
-                if is_global(r):
-                    globals_in_file += 1
-            if k not in per_union_dict:
-                rcopy = dict(r)
-                rcopy["_source_region"] = r.get("region","")
-                rcopy["_source_file"] = f.name
-                per_union_dict[k] = rcopy
+            arn_key = arn.lower()
+            if arn_key not in seen_arns_in_file:
+                seen_arns_in_file.add(arn_key)
+                unique_arn_in_file += 1
+            if arn_key not in union_by_arn:
+                row_std = to_schema(raw)
+                # provenance
+                row_std["_source_file"] = f.name
+                union_by_arn[arn_key] = row_std
 
-        per_file_stats.append({
+        per_files_stats.append({
             "source_file": f.name,
             "rows_read": rows_read,
-            "unique_after_dedupe_in_file": uniq_in_file,
-            "globals_count_in_file": globals_in_file,
-            "arn_missing_count_in_file": arn_missing,
+            "unique_arns_in_file": unique_arn_in_file,
+            "arn_missing_in_file": len(arn_missing_lines),
         })
+        if arn_missing_lines:
+            arn_missing_log.append({"source_file": f.name, "lines": arn_missing_lines})
 
-    return list(per_union_dict.values()), per_file_stats
+    return list(union_by_arn.values()), per_files_stats, arn_missing_log, per_files
 
-# ---------- ingest all-files ----------
+# ---------- Ingest ALL files (ARN-only) ----------
 def resolve_all_csvs(all_input: Path, name_filter: str, mode: str) -> List[Path]:
     if all_input.is_file():
         return [all_input]
@@ -238,150 +220,127 @@ def resolve_all_csvs(all_input: Path, name_filter: str, mode: str) -> List[Path]
         return list_csvs(all_input, name_filter)
     return []
 
-def dedupe_rows(rows_raw: List[Dict[str,str]], src_name: str) -> List[Dict[str,str]]:
-    uniq: Dict[str, Dict[str,str]] = {}
+def dedupe_all_by_arn(rows_raw: List[Dict[str,str]], src_name: str) -> Tuple[List[Dict[str,str]], int, List[str]]:
+    """
+    Return:
+      all_unique_rows (by ARN only),
+      rows_read_count,
+      arn_missing_lines (full-line strings)
+    """
+    # For ARN-missing logging, we need original header order:
+    # Reload with headers (we already have raw as orig maps).
+    # Here, rows_raw are original maps already.
+    rows_read = len(rows_raw)
+    uniq_by_arn: Dict[str, Dict[str,str]] = {}
+    arn_missing_lines: List[str] = []
+
+    # Capture header order from first row
+    field_order = list(rows_raw[0].keys()) if rows_raw else []
+
     for raw in rows_raw:
-        r = to_schema(raw)
-        fill_region_if_missing(r, src_name)
-        k = build_key(r)
-        if k and k not in uniq:
-            uniq[k] = r
-    return list(uniq.values())
+        arn = row_get_arn_normed(raw).strip()
+        if not arn:
+            arn_missing_lines.append(row_to_kv_line(raw, field_order))
+            continue
+        arn_key = arn.lower()
+        if arn_key not in uniq_by_arn:
+            uniq_by_arn[arn_key] = to_schema(raw)
 
-# ---------- write helpers ----------
-def write_csv(rows: List[Dict[str,str]], path: Path):
-    with open(path, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=OUT_HEADER)
-        w.writeheader()
-        for r in rows:
-            w.writerow({k: r.get(k, "") for k in OUT_HEADER})
+    return list(uniq_by_arn.values()), rows_read, arn_missing_lines
 
-def write_txt_line(fh, line=""):
-    fh.write(line + "\n")
+# ---------- Diff & reporting ----------
+OUT_HEADER = ["account","region","partition","service","resource_type","resource_id","resource_arn","aws_tags"]
 
-def write_txt_table(fh, rows: List[List[str]], header: List[str]):
-    widths = [len(h) for h in header]
-    for row in rows:
-        for i, cell in enumerate(row):
-            widths[i] = max(widths[i], len(str(cell)))
-    sep = "+".join("-"*(w+2) for w in widths)
-    # header
-    write_txt_line(fh, sep)
-    write_txt_line(fh, "| " + " | ".join(h.ljust(widths[i]) for i, h in enumerate(header)) + " |")
-    write_txt_line(fh, sep)
-    # rows
-    for row in rows:
-        write_txt_line(fh, "| " + " | ".join(str(cell).ljust(widths[i]) for i, cell in enumerate(row)) + " |")
-    write_txt_line(fh, sep)
-
-def rows_to_txt_list(rows: List[Dict[str,str]], extra_cols: List[str]=None) -> List[List[str]]:
-    extra_cols = extra_cols or []
-    out = []
+def rows_to_txt_block(rows: List[Dict[str,str]], extra_cols: List[str]=None) -> Tuple[List[str], List[List[str]]]:
+    cols = OUT_HEADER + (extra_cols or [])
+    table_rows = []
     for r in rows:
-        out.append([
-            r.get("account",""),
-            r.get("region",""),
-            r.get("partition",""),
-            r.get("service",""),
-            r.get("resource_type",""),
-            r.get("resource_id",""),
-            r.get("resource_arn",""),
-            r.get("aws_tags",""),
-            *[r.get(c,"") for c in extra_cols],
-        ])
-    return out
+        table_rows.append([r.get(c,"") for c in cols])
+    return cols, table_rows
 
-# ---------- comparison ----------
-def compare_and_write(per_union: List[Dict[str,str]],
-                      all_clean: List[Dict[str,str]],
-                      all_file_name: str,
-                      out_dirs: Dict[str, Path]) -> Dict[str,int]:
-    # sets
-    per_keys = {build_key(r) for r in per_union}
-    all_keys = {build_key(r) for r in all_clean}
-    inter_keys = per_keys & all_keys
+def write_diff_files(per_union: List[Dict[str,str]],
+                     all_rows: List[Dict[str,str]],
+                     all_file_name: str,
+                     out_reports: Path) -> Dict[str,int]:
+    # Sets by ARN only
+    per_arns = { (r.get("resource_arn","") or "").lower() for r in per_union if r.get("resource_arn") }
+    all_arns = { (r.get("resource_arn","") or "").lower() for r in all_rows if r.get("resource_arn") }
+    inter = per_arns & all_arns
 
-    # build missing (with provenance)
+    # Build dicts by arn for easy lookup
+    per_by_arn = { (r["resource_arn"] or "").lower(): r for r in per_union if r.get("resource_arn") }
+    all_by_arn = { (r["resource_arn"] or "").lower(): r for r in all_rows if r.get("resource_arn") }
+
+    # Missing: in per but not in all
     missing = []
-    for r in per_union:
-        if build_key(r) not in all_keys:
-            m = dict(r)
-            # expose provenance under clear names
-            m["source_region"] = r.get("_source_region", r.get("region",""))
-            m["source_file"] = r.get("_source_file","")
-            missing.append(m)
+    for arn in sorted(per_arns - all_arns):
+        r = dict(per_by_arn[arn])
+        r["source_file"] = r.pop("_source_file", r.get("source_file",""))
+        missing.append(r)
 
-    # build extra
+    # Extra: in all but not in per
     extra = []
-    for r in all_clean:
-        if build_key(r) not in per_keys:
-            e = dict(r)
-            e["source_all_file"] = all_file_name
-            extra.append(e)
+    for arn in sorted(all_arns - per_arns):
+        r = dict(all_by_arn[arn])
+        r["source_all_file"] = all_file_name
+        extra.append(r)
 
-    # write CSVs
-    missing_csv = out_dirs["reports"] / f"missing_in_all__{Path(all_file_name).stem}.csv"
-    extra_csv   = out_dirs["reports"] / f"extra_in_all__{Path(all_file_name).stem}.csv"
-    write_csv(missing, missing_csv)
-    write_csv(extra,   extra_csv)
+    # Write CSV
+    stem = Path(all_file_name).stem
+    missing_csv = out_reports / f"missing_in_all__{stem}.csv"
+    extra_csv   = out_reports / f"extra_in_all__{stem}.csv"
+    write_csv(missing_csv, missing, OUT_HEADER + ["source_file"])
+    write_csv(extra_csv,   extra,   OUT_HEADER + ["source_all_file"])
 
-    # write TXT detail (visibility)
-    detail_txt = out_dirs["reports"] / f"diff__{Path(all_file_name).stem}.txt"
-    with open(detail_txt, "w", encoding="utf-8") as fh:
+    # Write TXT tables (visibility)
+    diff_txt = out_reports / f"diff__{stem}.txt"
+    with open(diff_txt, "w", encoding="utf-8") as fh:
         write_txt_line(fh, f"DIFF for ALL file: {all_file_name}")
         write_txt_line(fh, f"Generated: {datetime.utcnow().isoformat()}Z")
-        write_txt_line(fh)
+        write_txt_line(fh, "")
 
         # Missing section
-        write_txt_line(fh, f"[MISSING in ALL] count={len(missing)} (present in per-region union, absent in ALL)")
+        write_txt_line(fh, f"[MISSING in ALL] count={len(missing)}")
         if missing:
-            header = OUT_HEADER + ["source_region","source_file"]
-            rows = rows_to_txt_list(missing, extra_cols=["source_region","source_file"])
-            write_txt_table(fh, rows, header)
+            header, rows = rows_to_txt_block(missing, ["source_file"])
+            write_txt_table(fh, header, rows)
         else:
             write_txt_line(fh, "(none)")
-        write_txt_line(fh)
+        write_txt_line(fh, "")
 
         # Extra section
-        write_txt_line(fh, f"[EXTRA in ALL] count={len(extra)} (present in ALL, absent in per-region union)")
+        write_txt_line(fh, f"[EXTRA in ALL] count={len(extra)}")
         if extra:
-            header = OUT_HEADER + ["source_all_file"]
-            rows = rows_to_txt_list(extra, extra_cols=["source_all_file"])
-            write_txt_table(fh, rows, header)
+            header, rows = rows_to_txt_block(extra, ["source_all_file"])
+            write_txt_table(fh, header, rows)
         else:
             write_txt_line(fh, "(none)")
 
-    # counts
-    matched_count = len(inter_keys)
     return {
-        "per_union_unique": len(per_union),
-        "all_unique": len(all_clean),
-        "matched": matched_count,
+        "per_union_unique": len(per_arns),
+        "all_unique": len(all_arns),
+        "matched": len(inter),
         "missing_in_all": len(missing),
         "extra_in_all": len(extra),
     }
 
-# ---------- main ----------
+# ---------- Main ----------
 def main():
     args = parse_args()
+
+    per_root = Path(args.per_root)
+    all_input = Path(args.all)
     out_dirs = ensure_dirs(Path(args.output).resolve())
 
-    # Validate inputs
-    per_root = Path(args.per_root)
     if not per_root.exists():
         raise SystemExit(f"[ERROR] --per-root not found: {per_root}")
-    all_input = Path(args.all)
     if not all_input.exists():
         raise SystemExit(f"[ERROR] --all not found: {all_input}")
 
-    # Ingest per-region files
-    per_files = list_per_region_csvs(per_root, args.filter)
-    if not per_files:
-        raise SystemExit(f"[ERROR] No per-region CSVs found under: {per_root} (filter='{args.filter}')")
+    # Build per-region union (ARN-only)
+    per_union, per_file_stats, per_arn_missing_log, per_files = build_per_union(per_root, args.filter)
 
-    per_union, per_file_stats = gather_per_union(per_root, args.filter)
-
-    # Resolve ALL files to compare
+    # Resolve ALL files
     if all_input.is_file():
         all_files = [all_input]
     else:
@@ -389,94 +348,112 @@ def main():
     if not all_files:
         raise SystemExit(f"[ERROR] No ALL CSVs found in: {all_input} (filter='{args.filter}', mode={args.all_mode})")
 
-    # Summaries
-    master_summary: List[Dict[str, str|int]] = []
-
-    # Precompute per-region file line counts (already in per_file_stats)
-    # Also compute line counts for ALL files (read + unique)
-    all_file_line_stats = []
-
     # Compare each ALL file
+    all_file_counts: List[Dict[str, str|int]] = []
+    all_file_line_stats: List[Dict[str, str|int]] = []
+    all_arn_missing_log: List[Dict[str, object]] = []
+
     for af in all_files:
-        rows_raw = load_csv_rows(af)
-        all_rows_read = len(rows_raw)
-        all_clean = dedupe_rows(rows_raw, af.name)
+        rows_raw, field_order = load_csv_with_headers(af)
+        all_unique_rows, all_rows_read, arn_missing_lines = dedupe_all_by_arn(rows_raw, af.name)
+        # Record line counts
         all_file_line_stats.append({
             "all_file": af.name,
             "rows_read": all_rows_read,
-            "unique_after_dedupe": len(all_clean),
+            "unique_arns_in_file": len(all_unique_rows),
+            "arn_missing_in_file": len(arn_missing_lines),
         })
+        if arn_missing_lines:
+            all_arn_missing_log.append({"all_file": af.name, "lines": arn_missing_lines})
 
-        counts = compare_and_write(per_union, all_clean, af.name, out_dirs)
-        master_summary.append({
-            "all_file": af.name,
-            **counts
-        })
+        # Diff + write missing/extra (CSV + TXT)
+        counts = write_diff_files(per_union, all_unique_rows, af.name, out_dirs["reports"])
+        counts["all_file"] = af.name
+        all_file_counts.append(counts)
 
-    # ===== Write summary.txt =====
+    # ===== summary.txt =====
     summary_txt = out_dirs["reports"] / "summary.txt"
     with open(summary_txt, "w", encoding="utf-8") as fh:
-        write_txt_line(fh, "Prowler Quick Inventory – Comparison Summary")
+        write_txt_line(fh, "Prowler Quick Inventory — ARN-only Comparison Summary")
         write_txt_line(fh, f"Generated: {datetime.utcnow().isoformat()}Z")
         write_txt_line(fh, "")
 
-        # Inputs
         write_txt_line(fh, "[INPUTS]")
         write_txt_line(fh, f"Per-region root : {per_root}")
         write_txt_line(fh, f"ALL input       : {all_input}  (mode={args.all_mode})")
         write_txt_line(fh, f"Filename filter : '{args.filter}'")
         write_txt_line(fh, "")
 
-        # Per-region file stats (total files + lines per file)
+        # Per-region files
         write_txt_line(fh, f"[PER-REGION FILES] total_files={len(per_files)}")
-        pr_header = ["source_file","rows_read","unique_after_dedupe_in_file","globals_count_in_file","arn_missing_count_in_file"]
+        pr_header = ["source_file","rows_read","unique_arns_in_file","arn_missing_in_file"]
         pr_rows = [[s[h] for h in pr_header] for s in per_file_stats]
-        write_txt_table(fh, pr_rows, pr_header)
+        write_txt_table(fh, pr_header, pr_rows)
         write_txt_line(fh, "")
 
-        # ALL files line counts
+        # ALL files (line counts)
         write_txt_line(fh, f"[ALL FILES] total_files={len(all_files)}")
-        af_header = ["all_file","rows_read","unique_after_dedupe"]
+        af_header = ["all_file","rows_read","unique_arns_in_file","arn_missing_in_file"]
         af_rows = [[s[h] for h in af_header] for s in all_file_line_stats]
-        write_txt_table(fh, af_rows, af_header)
+        write_txt_table(fh, af_header, af_rows)
         write_txt_line(fh, "")
 
         # Per ALL file comparison counts
-        write_txt_line(fh, "[COMPARISON COUNTS per ALL file]")
+        write_txt_line(fh, "[COMPARISON COUNTS per ALL file] (ARN-only)")
         cmp_header = ["all_file","per_union_unique","all_unique","matched","missing_in_all","extra_in_all"]
-        cmp_rows = [[m[h] for h in cmp_header] for m in master_summary]
-        write_txt_table(fh, cmp_rows, cmp_header)
+        cmp_rows = [[c[h] for h in cmp_header] for c in all_file_counts]
+        write_txt_table(fh, cmp_header, cmp_rows)
         write_txt_line(fh, "")
 
-        # Totals across all ALL files (note: matched/missing/extra are per-file; summing may double-count if files differ)
-        total_per_union = len(per_union)
-        total_all_unique_sum = sum(m["all_unique"] for m in master_summary)
-        total_matched_sum = sum(m["matched"] for m in master_summary)
-        total_missing_sum = sum(m["missing_in_all"] for m in master_summary)
-        total_extra_sum = sum(m["extra_in_all"] for m in master_summary)
-
-        write_txt_line(fh, "[TOTALS (sum across ALL files; note these may double-count if ALL files overlap)]")
+        # Totals across ALL files (note: sums may double-count across snapshots)
+        total_per_union_once = all_file_counts[0]["per_union_unique"] if all_file_counts else 0
+        sum_all_unique = sum(int(c["all_unique"]) for c in all_file_counts)
+        sum_matched = sum(int(c["matched"]) for c in all_file_counts)
+        sum_missing = sum(int(c["missing_in_all"]) for c in all_file_counts)
+        sum_extra = sum(int(c["extra_in_all"]) for c in all_file_counts)
+        write_txt_line(fh, "[TOTALS across ALL files (sums may double-count if files overlap)]")
         tot_header = ["per_union_unique_once","sum_all_unique","sum_matched","sum_missing_in_all","sum_extra_in_all"]
-        tot_rows = [[total_per_union, total_all_unique_sum, total_matched_sum, total_missing_sum, total_extra_sum]]
-        write_txt_table(fh, tot_rows, tot_header)
+        tot_rows = [[total_per_union_once, sum_all_unique, sum_matched, sum_missing, sum_extra]]
+        write_txt_table(fh, tot_header, tot_rows)
         write_txt_line(fh, "")
 
-        # Where to find diff details
-        write_txt_line(fh, "[OUTPUTS]")
-        write_txt_line(fh, f"Summary (this file): {summary_txt}")
-        for af in all_files:
-            stem = Path(af.name).stem
-            write_txt_line(fh, f"Missing CSV : {out_dirs['reports'] / ('missing_in_all__' + stem + '.csv')}")
-            write_txt_line(fh, f"Extra   CSV : {out_dirs['reports'] / ('extra_in_all__' + stem + '.csv')}")
-            write_txt_line(fh, f"Diff TXT    : {out_dirs['reports'] / ('diff__' + stem + '.txt')}")
+        # ARN-missing rows (Per-region)
+        write_txt_line(fh, "[ARN-MISSING ROWS IN PER-REGION FILES] (excluded from matching)")
+        if not per_arn_missing_log:
+            write_txt_line(fh, "(none)")
+        else:
+            for block in per_arn_missing_log:
+                write_txt_line(fh, f"  File: {block['source_file']}  ({len(block['lines'])} rows)")
+                for ln in block["lines"]:
+                    write_txt_line(fh, "    " + ln)
         write_txt_line(fh, "")
 
-    print(f"[OK] Wrote summary: {summary_txt}")
-    for af in all_files:
-        stem = Path(af.name).stem
-        print(f"[OK] Missing CSV : {out_dirs['reports'] / ('missing_in_all__' + stem + '.csv')}")
-        print(f"[OK] Extra   CSV : {out_dirs['reports'] / ('extra_in_all__' + stem + '.csv')}")
-        print(f"[OK] Diff TXT    : {out_dirs['reports'] / ('diff__' + stem + '.txt')}")
+        # ARN-missing rows (ALL files)
+        write_txt_line(fh, "[ARN-MISSING ROWS IN ALL FILES] (excluded from matching)")
+        if not all_arn_missing_log:
+            write_txt_line(fh, "(none)")
+        else:
+            for block in all_arn_missing_log:
+                write_txt_line(fh, f"  File: {block['all_file']}  ({len(block['lines'])} rows)")
+                for ln in block["lines"]:
+                    write_txt_line(fh, "    " + ln)
+        write_txt_line(fh, "")
+
+        # Pointers to diff artifacts
+        write_txt_line(fh, "[OUTPUT ARTIFACTS]")
+        for c in all_file_counts:
+            stem = Path(c["all_file"]).stem
+            write_txt_line(fh, f"  Missing CSV : {out_dirs['reports'] / ('missing_in_all__' + stem + '.csv')}")
+            write_txt_line(fh, f"  Extra   CSV : {out_dirs['reports'] / ('extra_in_all__' + stem + '.csv')}")
+            write_txt_line(fh, f"  Diff TXT    : {out_dirs['reports'] / ('diff__' + stem + '.txt')}")
+        write_txt_line(fh, "")
+
+    print(f"[OK] Summary written: {summary_txt}")
+    for c in all_file_counts:
+        stem = Path(c["all_file"]).stem
+        print(f"[OK] Missing CSV: {out_dirs['reports'] / ('missing_in_all__' + stem + '.csv')}")
+        print(f"[OK] Extra   CSV: {out_dirs['reports'] / ('extra_in_all__' + stem + '.csv')}")
+        print(f"[OK] Diff TXT   : {out_dirs['reports'] / ('diff__' + stem + '.txt')}")
 
 if __name__ == "__main__":
     main()
