@@ -1,0 +1,256 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+Part 1 — Run Prowler Quick Inventory per-region with per-region outputs and a reasoned skip log.
+
+What it does
+------------
+- Enumerates AWS regions (AWS CLI -> fallback list -> optional file).
+- For each region, runs:
+    prowler aws --quick-inventory --filter-region <REGION> -M csv,json -o <OUT>/<REGION> -F quickinv_<REGION>_<stamp>
+- Captures stdout/stderr to logs/<REGION>.log
+- Writes a summary CSV with region, status (SUCCESS/FAILED), exit_code, parsed reason, output CSV/JSON paths.
+
+Notes
+-----
+- If your Prowler build prefers "--region" instead of "--filter-region", set REGION_FLAG="--region" below.
+- Quick Inventory flag is -i / --quick-inventory.  (Docs)  # https://docs.prowler.com/user-guide/cli/tutorials/quick-inventory
+- Filter region flag is -f / --filter-region.           (Docs)
+"""
+
+import argparse
+import csv
+import os
+import shlex
+import subprocess
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+from typing import List, Dict, Optional
+
+# ---------------- Configuration defaults ----------------
+REGION_FLAG = "--filter-region"  # change to "--region" if your build expects it
+PROWLER_BIN = "prowler"
+
+# Fallback list (kept broad and current). Trim if you want fewer:
+FALLBACK_REGIONS = [
+    # Africa
+    "af-south-1",
+    # Asia Pacific
+    "ap-east-1",
+    "ap-south-1", "ap-south-2",
+    "ap-southeast-1", "ap-southeast-2", "ap-southeast-3", "ap-southeast-4", "ap-southeast-5", "ap-southeast-6", "ap-southeast-7",
+    "ap-northeast-1", "ap-northeast-2", "ap-northeast-3",
+    # Canada
+    "ca-central-1", "ca-west-1",
+    # Europe
+    "eu-central-1", "eu-central-2",
+    "eu-west-1", "eu-west-2", "eu-west-3",
+    "eu-north-1",
+    "eu-south-1", "eu-south-2",
+    # Middle East
+    "il-central-1",
+    "me-south-1", "me-central-1",
+    # South America
+    "sa-east-1",
+    # US
+    "us-east-1", "us-east-2", "us-west-1", "us-west-2",
+]
+
+def parse_args():
+    p = argparse.ArgumentParser("Run Prowler quick-inventory per region with per-region outputs and logging.")
+    p.add_argument("--profile", default="", help="AWS profile to export as AWS_PROFILE.")
+    p.add_argument("--output", default="./quickinv_by_region", help="Base output folder.")
+    p.add_argument("--regions-file", default="", help="Optional file with one region per line (or comma/space separated).")
+    p.add_argument("--timeout", type=int, default=0, help="Per-region timeout in seconds (0 = no timeout).")
+    p.add_argument("--prefix", default="quickinv", help="Filename prefix for Prowler outputs.")
+    p.add_argument("--prowler-bin", default=PROWLER_BIN, help="Prowler executable name/path.")
+    return p.parse_args()
+
+def ts() -> str:
+    return datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+
+def ensure_dirs(base: Path) -> Dict[str, Path]:
+    d = {
+        "root": base,
+        "logs": base / "logs",
+        "reports": base / "reports",
+    }
+    for v in d.values():
+        v.mkdir(parents=True, exist_ok=True)
+    return d
+
+def run_cmd(cmd: List[str], env: dict, timeout: int) -> (int, str):
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
+    out_lines = []
+    start = time.time()
+    while True:
+        line = proc.stdout.readline()
+        if line:
+            out_lines.append(line)
+        if proc.poll() is not None:
+            break
+        if timeout and (time.time() - start) > timeout:
+            proc.kill()
+            out_lines.append(f"[ERROR] Timed out after {timeout}s\n")
+            return 124, "".join(out_lines)
+    return proc.returncode, "".join(out_lines)
+
+def get_regions_from_cli(env: dict) -> List[str]:
+    try:
+        # Prefer AWS CLI so we only hit enabled/known regions for the account/partition.
+        cmd = ["aws", "ec2", "describe-regions", "--all-regions", "--query", "Regions[].RegionName", "--output", "text"]
+        rc, out = run_cmd(cmd, env, timeout=30)
+        if rc == 0 and out.strip():
+            return out.split()
+        else:
+            return []
+    except Exception:
+        return []
+
+def read_regions_file(path: Path) -> List[str]:
+    text = path.read_text(encoding="utf-8", errors="ignore")
+    # accept comma/space/newline separators
+    raw = [r.strip() for r in text.replace(",", " ").split()]
+    return [r for r in raw if r]
+
+def newest_file(folder: Path, prefix: str, ext: str) -> Optional[Path]:
+    candidates = list(folder.glob(f"**/{prefix}*.{ext}"))
+    if not candidates:
+        return None
+    return max(candidates, key=lambda p: p.stat().st_mtime)
+
+def parse_reason(text: str, exit_code: int) -> str:
+    low = text.lower()
+    # Common AWS / boto / endpoint errors Prowler may bubble up
+    patterns = {
+        "OptInRequired": "Region not enabled (OptInRequired)",
+        "authfailure": "AuthFailure (bad/missing creds or region policy)",
+        "accessdenied": "AccessDenied (insufficient permissions)",
+        "signaturedoesnotmatch": "SignatureDoesNotMatch (clock skew or wrong keys)",
+        "expiredtoken": "ExpiredToken",
+        "invalidclienttokenid": "InvalidClientTokenId",
+        "noregion": "NoRegion (set AWS_DEFAULT_REGION or pass region)",
+        "could not connect to the endpoint": "EndpointConnectionError",
+        "throttl": "Throttling",
+        "unsupported": "Unsupported region/service",
+        "unknown endpoint": "UnknownEndpoint (bad region code?)",
+        "assumerole": "AssumeRole failure",
+        "token": "STS/Token issue",
+        "profile": "Profile issue",
+    }
+    for k, v in patterns.items():
+        if k in low:
+            return v
+    if exit_code == 124:
+        return "Timed out"
+    if exit_code != 0:
+        return "Non-zero exit (see log)"
+    return "OK"
+
+def main():
+    args = parse_args()
+
+    # Verify prowler binary
+    try:
+        rc, out = run_cmd([args.prowler_bin, "--version"], env=os.environ.copy(), timeout=15)
+        if rc != 0:
+            print(f"[ERROR] Cannot run '{args.prowler_bin} --version'. Output:\n{out}")
+            sys.exit(1)
+    except FileNotFoundError:
+        print(f"[ERROR] '{args.prowler_bin}' not found in PATH.")
+        sys.exit(1)
+
+    # Env
+    env = os.environ.copy()
+    if args.profile:
+        env["AWS_PROFILE"] = args.profile
+
+    # Folders
+    base = Path(args.output).resolve()
+    dirs = ensure_dirs(base)
+    stamp = ts()
+
+    # Regions
+    regions: List[str] = []
+    if args.regions_file:
+        path = Path(args.regions_file).expanduser().resolve()
+        if not path.exists():
+            print(f"[ERROR] --regions-file not found: {path}")
+            sys.exit(1)
+        regions = read_regions_file(path)
+    else:
+        regions = get_regions_from_cli(env)
+        if not regions:
+            print("[WARN] Could not enumerate regions via AWS CLI. Falling back to static list.")
+            regions = FALLBACK_REGIONS
+
+    # Run per region
+    summary_rows = []
+    for region in regions:
+        region_out_dir = base / region
+        region_out_dir.mkdir(parents=True, exist_ok=True)
+        log_path = dirs["logs"] / f"{region}.log"
+
+        # Build prowler command
+        # Docs: -i/--quick-inventory ; -f/--filter-region <region> ; -M csv,json ; -o ; -F  :contentReference[oaicite:1]{index=1}
+        prefix = f"{args.prefix}_{region}_{stamp}"
+        cmd = [
+            args.prowler_bin, "aws",
+            "--quick-inventory",
+            REGION_FLAG, region,
+            "-M", "csv,json",
+            "-o", str(region_out_dir),
+            "-F", prefix
+        ]
+
+        start = time.time()
+        rc, out = run_cmd(cmd, env, timeout=args.timeout)
+        duration = round(time.time() - start, 1)
+        log_path.write_text(" ".join(shlex.quote(c) for c in cmd) + "\n\n" + out, encoding="utf-8", errors="ignore")
+
+        reason = parse_reason(out, rc)
+        status = "SUCCESS" if rc == 0 else "FAILED"
+
+        # Try to locate produced files
+        csv_file = newest_file(region_out_dir, prefix, "csv")
+        json_file = newest_file(region_out_dir, prefix, "json")
+
+        summary_rows.append({
+            "region": region,
+            "status": status,
+            "exit_code": rc,
+            "reason": reason,
+            "csv_path": str(csv_file or ""),
+            "json_path": str(json_file or ""),
+            "log_path": str(log_path),
+            "duration_sec": duration
+        })
+
+        print(f"[{status}] {region} ({duration}s) — {reason}")
+
+    # Write summary CSV
+    reports_dir = dirs["reports"]
+    summary_csv = reports_dir / f"summary_{stamp}.csv"
+    with open(summary_csv, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=[
+            "region","status","exit_code","reason","csv_path","json_path","log_path","duration_sec"
+        ])
+        w.writeheader()
+        w.writerows(summary_rows)
+
+    # Console recap
+    total = len(summary_rows)
+    ok = sum(1 for r in summary_rows if r["status"] == "SUCCESS")
+    bad = total - ok
+    print("\n=== SUMMARY ===")
+    print(f" Regions attempted : {total}")
+    print(f" SUCCESS          : {ok}")
+    print(f" FAILED           : {bad}")
+    print(f" Output folder    : {base}")
+    print(f" Summary CSV      : {summary_csv}")
+
+if __name__ == "__main__":
+    main()
