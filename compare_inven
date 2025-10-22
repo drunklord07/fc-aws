@@ -1,0 +1,450 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+Compare Prowler Quick Inventory CSVs:
+- Union of per-region files vs each all-regions file.
+
+Outputs (under OUTPUT_DIR):
+  normalized/
+    per_regions_flat.csv                       # union of per-region rows (unique by key)
+    all_regions_flat__<all-file-stem>.csv      # unique rows for each all-file
+  reports/
+    per_region_file_stats.csv                  # rows per per-region file (read/unique/globals/ARN-missing)
+    all_files_summary.csv                      # per all-file counts: union vs all-file, missing/extra, globals
+    missing_in_all__<all-file-stem>.csv        # in per-union but NOT in that all-file (+ source_region/source_file)
+    extra_in_all__<all-file-stem>.csv          # in that all-file but NOT in per-union (+ source_all_file)
+    coverage_by_region_counts__<all-file-stem>.csv
+                                               # counts only (no %): selected vs matched, with globals split out
+
+Notes:
+- Primary unique key = lowercased ARN. Fallback only if ARN is blank.
+- "Global" = blank/('global'/'aws-global') region OR ARN with empty region segment (e.g., IAM).
+- Safe with both ';' and ',' CSVs; tolerant of header variants.
+"""
+
+from __future__ import annotations
+import argparse
+import csv
+import re
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+# ========== CONFIG (edit these) ==========
+ALL_INPUT   = r"./inventory/all"        # File OR folder containing all-regions CSV(s)
+PER_ROOT    = r"./inventory/per_region" # Folder with per-region CSVs (flat or in subfolders)
+OUTPUT_DIR  = r"./compare_out"          # Where reports/normalized outputs will be written
+PREFIX      = "prowler"                 # Only consider CSVs whose filename contains this (set "" to consider all)
+ALL_MODE    = "each"                    # If ALL_INPUT is a folder: "latest" or "each"
+# =========================================
+
+def parse_args():
+    p = argparse.ArgumentParser("Compare Prowler Quick Inventory: per-region union vs all-regions CSV(s).")
+    p.add_argument("--all", default=ALL_INPUT, help="Path to ALL-REGIONS CSV file OR a folder containing CSVs.")
+    p.add_argument("--per-root", default=PER_ROOT, help="Root folder with per-region CSVs (flat or subfolders).")
+    p.add_argument("--output", default=OUTPUT_DIR, help="Output folder for reports/normalized CSVs.")
+    p.add_argument("--prefix", default=PREFIX, help="Filename filter: only consider CSVs whose name contains this.")
+    p.add_argument("--all-mode", choices=["latest", "each"], default=ALL_MODE,
+                   help="If --all is a folder: pick newest CSV (latest) or compare EACH CSV (each).")
+    return p.parse_args()
+
+# ---------- IO helpers ----------
+def ensure_dirs(base: Path) -> Dict[str, Path]:
+    d = {"root": base, "normalized": base / "normalized", "reports": base / "reports"}
+    for v in d.values():
+        v.mkdir(parents=True, exist_ok=True)
+    return d
+
+def detect_sep(csv_path: Path) -> str:
+    with open(csv_path, "r", encoding="utf-8", errors="replace") as f:
+        head = f.readline()
+    if ";" in head and "," not in head:
+        return ";"
+    return ";" if head.count(";") >= head.count(",") else ","
+
+def norm_header(h: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", h.strip().lower())
+
+def load_csv_rows(path: Path) -> List[Dict[str, str]]:
+    sep = detect_sep(path)
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        rdr = csv.DictReader(f, delimiter=sep)
+        rows = []
+        for r in rdr:
+            rows.append({norm_header(k): (v or "").strip() for k, v in r.items()})
+        return rows
+
+def newest_csv(folder: Path, prefix: str) -> Optional[Path]:
+    cs = [p for p in folder.rglob("*.csv") if (prefix in p.name) or (not prefix)]
+    if not cs:
+        cs = list(folder.rglob("*.csv"))
+    return max(cs, key=lambda p: p.stat().st_mtime) if cs else None
+
+def list_csvs(folder: Path, prefix: str) -> List[Path]:
+    cs = [p for p in folder.rglob("*.csv") if (prefix in p.name) or (not prefix)]
+    return sorted(cs, key=lambda p: p.stat().st_mtime)
+
+def region_from_filename(name: str) -> str:
+    """
+    Best-effort region inference from filename tail.
+    Accepts hyphens or underscores; returns with hyphens.
+    e.g., ..._ap_south_2.csv -> ap-south-2
+    """
+    base = Path(name).stem
+    # take the last token-like thing after final underscore/hyphen
+    # then normalize underscores->hyphens
+    token = re.split(r"[_-]", base)[-1]
+    token = token.replace("_", "-")
+    # quick fixes (ap-south2 -> ap-south-2)
+    token = re.sub(r"^([a-z]+-[a-z]+)(\d)$", r"\1-\2", token)
+    return token
+
+# ---------- Normalization to your schema ----------
+# Your columns:
+# Account, Region, partition, service, resource type, resource id, resource arn, aws tags
+COL_MAP = {
+    "account": ["account", "account_id"],
+    "region": ["region"],
+    "partition": ["partition"],
+    "service": ["service", "service_name"],
+    "resource_type": ["resource_type", "type", "resource type"],
+    "resource_id": ["resource_id", "id", "name", "resource id", "resource_name"],
+    "resource_arn": ["resource_arn", "arn", "resource arn"],
+    "aws_tags": ["aws_tags", "tags"],
+}
+
+def pick(row: Dict[str, str], keys: List[str]) -> str:
+    for k in keys:
+        k2 = norm_header(k)
+        if k2 in row and row[k2]:
+            return row[k2]
+    return ""
+
+def to_schema(row: Dict[str, str]) -> Dict[str, str]:
+    return {
+        "account": pick(row, COL_MAP["account"]),
+        "region": pick(row, COL_MAP["region"]),
+        "partition": pick(row, COL_MAP["partition"]),
+        "service": pick(row, COL_MAP["service"]),
+        "resource_type": pick(row, COL_MAP["resource_type"]),
+        "resource_id": pick(row, COL_MAP["resource_id"]),
+        "resource_arn": pick(row, COL_MAP["resource_arn"]),
+        "aws_tags": pick(row, COL_MAP["aws_tags"]),
+    }
+
+def arn_region(arn: str) -> str:
+    # arn:partition:service:region:account-id:resource
+    try:
+        parts = arn.split(":", 5)
+        return parts[3] if len(parts) >= 6 else ""
+    except Exception:
+        return ""
+
+def is_global(r: Dict[str, str]) -> bool:
+    reg = (r.get("region") or "").strip().lower()
+    if reg in {"", "global", "aws-global"}:
+        return True
+    arn = (r.get("resource_arn") or "").strip()
+    if arn and arn_region(arn) == "":
+        return True
+    return False
+
+def build_key(r: Dict[str, str]) -> str:
+    arn = (r.get("resource_arn") or "").strip()
+    if arn:
+        return arn.lower()
+    # Composite fallback includes account & partition
+    account = (r.get("account") or "").strip().lower()
+    part = (r.get("partition") or "").strip().lower()
+    reg = (r.get("region") or "").strip().lower()
+    svc = (r.get("service") or "").strip().lower()
+    rty = (r.get("resource_type") or "").strip().lower()
+    rid = (r.get("resource_id") or "").strip()  # keep case
+    return f"{account}|{part}|{reg}|{svc}|{rty}|{rid}"
+
+def fill_region_if_missing(r: Dict[str, str], filename: str) -> None:
+    if (r.get("region") or "").strip():
+        return
+    arn = (r.get("resource_arn") or "").strip()
+    reg = arn_region(arn)
+    if reg:
+        r["region"] = reg
+    else:
+        guess = region_from_filename(filename)
+        # only fill guess if it looks like a region-ish token
+        if re.match(r"^[a-z]{2,}-[a-z]+-\d+$", guess):
+            r["region"] = guess
+
+def save_csv(rows: List[Dict[str, str]], path: Path, header: Optional[List[str]] = None):
+    if not header:
+        header = ["account","region","partition","service","resource_type","resource_id","resource_arn","aws_tags"]
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=header)
+        w.writeheader()
+        for r in rows:
+            row = {k: r.get(k, "") for k in header}
+            w.writerow(row)
+
+# ---------- Per-root ingest & union ----------
+def list_per_region_csvs(per_root: Path, prefix: str) -> List[Path]:
+    # all CSVs under per_root, skipping admin dirs
+    out = []
+    for p in per_root.rglob("*.csv"):
+        if any(part in {"logs","reports","normalized"} for part in p.parts):
+            continue
+        if prefix and (prefix not in p.name):
+            continue
+        out.append(p)
+    return sorted(out, key=lambda p: p.stat().st_mtime)
+
+def gather_per_union(per_root: Path, prefix: str) -> Tuple[List[Dict[str, str]], List[Dict[str, str]]]:
+    """
+    Returns:
+      per_union (unique rows)
+      per_file_stats (rows_read, unique_in_file, globals_count, arn_missing_count)
+    """
+    files = list_per_region_csvs(per_root, prefix)
+    per_union_dict: Dict[str, Dict[str, str]] = {}
+    per_file_stats: List[Dict[str, str]] = []
+
+    for f in files:
+        rows_raw = load_csv_rows(f)
+        rows_read = len(rows_raw)
+        uniq_in_file = 0
+        globals_in_file = 0
+        arn_missing = 0
+        seen_keys_file = set()
+
+        for raw in rows_raw:
+            r = to_schema(raw)
+            fill_region_if_missing(r, f.name)
+            key = build_key(r)
+            if not key:
+                arn_missing += 1 if not r.get("resource_arn") else 0
+                continue
+            if key not in seen_keys_file:
+                seen_keys_file.add(key)
+                uniq_in_file += 1
+                if is_global(r):
+                    globals_in_file += 1
+            # Add to global union if new; keep first-seen file/region for provenance
+            if key not in per_union_dict:
+                r_copy = dict(r)
+                r_copy["_source_region"] = r.get("region", "")
+                r_copy["_source_file"] = str(f.name)
+                per_union_dict[key] = r_copy
+
+        per_file_stats.append({
+            "region": per_union_dict[next(iter(per_union_dict))]["_source_region"] if per_union_dict else "",
+            "source_file": str(f.name),
+            "rows_read": rows_read,
+            "unique_after_dedupe_in_file": uniq_in_file,
+            "globals_count_in_file": globals_in_file,
+            "arn_missing_count_in_file": arn_missing,
+        })
+
+    per_union = list(per_union_dict.values())
+    return per_union, per_file_stats
+
+# ---------- ALL files ingest ----------
+def resolve_all_csvs(all_input: Path, prefix: str, mode: str) -> List[Path]:
+    if all_input.is_file():
+        return [all_input]
+    if all_input.is_dir():
+        if mode == "latest":
+            picked = newest_csv(all_input, prefix)
+            return [picked] if picked else []
+        return list_csvs(all_input, prefix)
+    return []
+
+# ---------- Comparison ----------
+def compare(per_union: List[Dict[str, str]],
+            all_clean: List[Dict[str, str]],
+            all_file_stem: str,
+            out_dirs: Dict[str, Path]) -> Tuple[int, int, int, int, int, int]:
+    """
+    Writes:
+      missing_in_all__<stem>.csv
+      extra_in_all__<stem>.csv
+      coverage_by_region_counts__<stem>.csv
+    Returns (counts):
+      per_union_unique, all_unique, missing_count, extra_count,
+      globals_in_union, globals_in_all
+    """
+    # Index sets
+    per_keys = {build_key(r) for r in per_union}
+    all_keys = {build_key(r) for r in all_clean}
+
+    # Missing / Extra
+    missing = []
+    for r in per_union:
+        if build_key(r) not in all_keys:
+            miss = dict(r)
+            miss["source_region"] = r.get("_source_region", r.get("region",""))
+            miss["source_file"] = r.get("_source_file", "")
+            miss["key"] = build_key(r)
+            # purge internals
+            miss.pop("_source_region", None); miss.pop("_source_file", None)
+            missing.append(miss)
+
+    extra = []
+    for r in all_clean:
+        if build_key(r) not in per_keys:
+            add = dict(r)
+            add["source_all_file"] = f"{all_file_stem}.csv"
+            add["key"] = build_key(r)
+            extra.append(add)
+
+    # Save missing/extra
+    missing_path = out_dirs["reports"] / f"missing_in_all__{all_file_stem}.csv"
+    extra_path   = out_dirs["reports"] / f"extra_in_all__{all_file_stem}.csv"
+    save_csv(missing, missing_path)
+    save_csv(extra, extra_path)
+
+    # Coverage counts by region (no percentages)
+    # selected = per-union; matched = present in all; split globals vs non-globals
+    # also count how many rows the all-file has per region (for reference)
+    by_region: Dict[str, Dict[str, int]] = {}
+
+    def bump(map_, reg: str, field: str, inc: int = 1):
+        b = map_.setdefault(reg, {
+            "selected_count": 0,
+            "selected_non_global_count": 0,
+            "matched_non_global_in_all_count": 0,
+            "selected_globals_count": 0,
+            "matched_globals_in_all_count": 0,
+            "all_file_count": 0
+        })
+        b[field] = b.get(field, 0) + inc
+
+    all_keyset = {build_key(r) for r in all_clean}
+
+    for r in per_union:
+        reg = (r.get("region") or "").strip() or "aws-global"
+        bump(by_region, reg, "selected_count")
+        if is_global(r):
+            bump(by_region, reg, "selected_globals_count")
+            if build_key(r) in all_keyset:
+                bump(by_region, reg, "matched_globals_in_all_count")
+        else:
+            bump(by_region, reg, "selected_non_global_count")
+            if build_key(r) in all_keyset:
+                bump(by_region, reg, "matched_non_global_in_all_count")
+
+    for r in all_clean:
+        reg = (r.get("region") or "").strip() or "aws-global"
+        bump(by_region, reg, "all_file_count")
+
+    cov_rows = []
+    for reg in sorted(by_region.keys()):
+        st = by_region[reg]
+        cov_rows.append({
+            "region": reg,
+            "selected_count_including_globals": st["selected_count"],
+            "selected_non_global_count": st["selected_non_global_count"],
+            "matched_non_global_in_all_count": st["matched_non_global_in_all_count"],
+            "selected_globals_count": st["selected_globals_count"],
+            "matched_globals_in_all_count": st["matched_globals_in_all_count"],
+            "all_file_count": st["all_file_count"],
+        })
+
+    cov_path = out_dirs["reports"] / f"coverage_by_region_counts__{all_file_stem}.csv"
+    with open(cov_path, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=[
+            "region",
+            "selected_count_including_globals",
+            "selected_non_global_count",
+            "matched_non_global_in_all_count",
+            "selected_globals_count",
+            "matched_globals_in_all_count",
+            "all_file_count",
+        ])
+        w.writeheader()
+        for r in cov_rows:
+            w.writerow(r)
+
+    globals_in_union = sum(1 for r in per_union if is_global(r))
+    globals_in_all   = sum(1 for r in all_clean if is_global(r))
+
+    return len(per_union), len(all_clean), len(missing), len(extra), globals_in_union, globals_in_all
+
+# ---------- Main ----------
+def main():
+    args = parse_args()
+    out_dirs = ensure_dirs(Path(args.output).resolve())
+
+    per_root = Path(args.per_root)
+    if not per_root.exists():
+        print(f"[ERROR] --per-root not found: {per_root}")
+        return
+
+    # Ingest per-region union
+    per_union, per_file_stats = gather_per_union(per_root, args.prefix)
+    save_csv(per_union, out_dirs["normalized"] / "per_regions_flat.csv")
+    # Write per-file stats
+    with open(out_dirs["reports"] / "per_region_file_stats.csv", "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=[
+            "region","source_file","rows_read","unique_after_dedupe_in_file","globals_count_in_file","arn_missing_count_in_file"
+        ])
+        w.writeheader()
+        for s in per_file_stats:
+            w.writerow(s)
+    print(f"[INFO] Per-region union (unique rows): {len(per_union)} from {len(per_file_stats)} file(s)")
+
+    # Resolve all-files
+    all_input = Path(args.all)
+    all_csvs = resolve_all_csvs(all_input, args.prefix, args.all_mode)
+    if not all_csvs:
+        print(f"[ERROR] No all-regions CSV(s) found in: {all_input}")
+        return
+
+    # Summarize across all-files
+    summary_rows = []
+    for csv_path in all_csvs:
+        name = csv_path.stem
+        rows_raw = load_csv_rows(csv_path)
+        # Normalize & dedupe
+        all_clean_dict = {}
+        for raw in rows_raw:
+            r = to_schema(raw)
+            fill_region_if_missing(r, csv_path.name)
+            k = build_key(r)
+            if k and k not in all_clean_dict:
+                all_clean_dict[k] = r
+        all_clean = list(all_clean_dict.values())
+        save_csv(all_clean, out_dirs["normalized"] / f"all_regions_flat__{name}.csv")
+
+        per_count, all_count, miss_count, extra_count, g_union, g_all = compare(
+            per_union, all_clean, name, out_dirs
+        )
+
+        summary_rows.append({
+            "all_file": csv_path.name,
+            "per_union_unique": per_count,
+            "all_unique": all_count,
+            "missing_in_all": miss_count,
+            "extra_in_all": extra_count,
+            "globals_in_per_union": g_union,
+            "globals_in_all": g_all,
+        })
+
+        print(f"[INFO] Compared '{csv_path.name}': union={per_count}, all={all_count}, missing={miss_count}, extra={extra_count}")
+
+    # Write master summary
+    sum_path = out_dirs["reports"] / "all_files_summary.csv"
+    with open(sum_path, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=[
+            "all_file","per_union_unique","all_unique","missing_in_all","extra_in_all",
+            "globals_in_per_union","globals_in_all"
+        ])
+        w.writeheader()
+        for r in summary_rows:
+            w.writerow(r)
+
+    print("\n=== DONE ===")
+    print(f" Reports  : {out_dirs['reports']}")
+    print(f" Normalized tables: {out_dirs['normalized']}")
+    print(f" Summary  : {sum_path}")
+
+if __name__ == "__main__":
+    main()
