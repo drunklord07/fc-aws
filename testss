@@ -30,3 +30,11 @@ aws s3api list-buckets --query 'Buckets[].Name' --output text \
   done | tee buckets_access_denied.txt
 
 wc -l buckets_access_denied.txt   # count of denied buckets
+
+.......
+aws s3api list-buckets --query 'Buckets[].Name' --output text \
+| tr '\t' '\n' \
+| while read -r b; do
+    aws s3api get-bucket-location --bucket "$b" >/dev/null 2>&1 || echo x
+  done \
+| wc -l
