@@ -1,0 +1,20 @@
+# See if a config is being used and whether it injects filters
+grep -iE 'filter-|services|tags|arns' ~/.prowler/config.yaml 2>/dev/null || echo "no prowler config"
+
+# Also check if your shell exports default args
+echo "PROWLER_ARGS=${PROWLER_ARGS:-<unset>}"
+
+
+
+................
+
+prowler aws -i --profile <p_full> --log-level DEBUG -M csv -o ./qi_out
+grep -E "s3:|AccessDenied|Throttl|error" ./qi_out/*DEBUG*.log | sed -n '1,120p'
+
+
+.....
+# Buckets with null LocationConstraint (these are us-east-1)
+for b in $(aws s3api list-buckets --profile <p_full> --query 'Buckets[].Name' --output text); do
+  loc=$(aws s3api get-bucket-location --bucket "$b" --profile <p_full> --query 'LocationConstraint' --output text)
+  [ "$loc" = "None" -o "$loc" = "null" -o "$loc" = "NoneType" ] && echo "$b"
+done | wc -l
