@@ -61,4 +61,22 @@ comm -23 cli_buckets.txt prowler_buckets.txt | tee missing_in_prowler.txt
 wc -l missing_in_prowler.txt
 head -n 20 missing_in_prowler.txt
 
+-------------------------
+
+aws s3api list-buckets --query 'Buckets[].Name' --output text \
+| tr '\t' '\n' \
+| while read -r b; do
+    out=$(aws s3api head-bucket --bucket "$b" 2>&1); rc=$?
+    if [ $rc -eq 0 ]; then
+      echo "OK,$b,200"
+    else
+      code=$(printf "%s" "$out" | grep -o 'Status Code: [0-9]\+' | awk '{print $3}')
+      reason=$(printf "%s" "$out" | sed -n 's/.*\(AccessDenied\|Forbidden\|NotFound\|MovedPermanently\|PermanentRedirect\).*/\1/p' | head -n1)
+      echo "FAIL,$b,${code:-?},${reason:-?}"
+    fi
+  done | tee headbucket_status.csv
+
+# Quick counts
+echo "OK count:   $(grep -c '^OK,'   headbucket_status.csv || true)"
+echo "FAIL count: $(grep -c '^FAIL,' headbucket_status.csv || true)"
 
