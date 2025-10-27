@@ -38,3 +38,27 @@ aws s3api list-buckets --query 'Buckets[].Name' --output text \
     aws s3api get-bucket-location --bucket "$b" >/dev/null 2>&1 || echo x
   done \
 | wc -l
+
+
+
+
+???????????????????????????
+
+# 1) Run Quick-Inventory cleanly and log everything
+prowler aws -i -M csv,json --log-level DEBUG -o ./qi_out
+
+# 2) Buckets Prowler recorded
+awk -F';' 'NR==1{for(i=1;i<=NF;i++)h[$i]=i}
+           NR>1 && $h["AWS_Service"]=="s3"{print $h["AWS_ResourceID"]}' \
+  qi_out/*quick-inventory*.csv | sort -u > prowler_buckets.txt
+
+# 3) Buckets the CLI sees
+aws s3api list-buckets --query 'Buckets[].Name' --output text \
+| tr '\t' '\n' | sort -u > cli_buckets.txt
+
+# 4) What’s missing in Prowler (count + sample)
+comm -23 cli_buckets.txt prowler_buckets.txt | tee missing_in_prowler.txt
+wc -l missing_in_prowler.txt
+head -n 20 missing_in_prowler.txt
+
+
