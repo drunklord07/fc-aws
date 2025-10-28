@@ -115,3 +115,6 @@ check_api get-bucket-location
 
 
 ))))))))))))))))))))))))))))))))))))))))))))))))
+aws iam list-attached-role-policies --role-name "$ROLE" \
+  --query "AttachedPolicies[?PolicyName=='SecurityAudit' || PolicyName=='AmazonS3ReadOnlyAccess'].[PolicyName,PolicyArn]" \
+  --output table
