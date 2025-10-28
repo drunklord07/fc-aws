@@ -80,3 +80,38 @@ aws s3api list-buckets --query 'Buckets[].Name' --output text \
 echo "OK count:   $(grep -c '^OK,'   headbucket_status.csv || true)"
 echo "FAIL count: $(grep -c '^FAIL,' headbucket_status.csv || true)"
 
+))))))))))))))))))))))))))))))))))))))
+
+
+
+
+# Buckets your creds can see (ground truth)
+aws s3api list-buckets --query 'Buckets[].Name' --output text \
+| tr '\t' '\n' > /tmp/_buckets.txt
+
+# Quick counter for any S3 API across all buckets
+check_api() {
+  api="$1"
+  printf "%-28s" "$api:"
+  denied=$(
+    while read -r b; do
+      aws s3api $api --bucket "$b" >/dev/null 2>&1 || echo x
+    done < /tmp/_buckets.txt | wc -l
+  )
+  total=$(wc -l < /tmp/_buckets.txt)
+  echo "$denied denied of $total"
+}
+
+# Run the usual QI culprits (most common blocker is TAGGING or POLICY STATUS)
+check_api head-bucket
+check_api get-bucket-tagging
+check_api get-bucket-policy-status
+check_api get-public-access-block
+check_api get-encryption-configuration
+check_api get-bucket-acl
+check_api get-bucket-versioning
+# (optional) legacy call used by some tools; 'None' means us-east-1, not a failure
+check_api get-bucket-location
+
+
+))))))))))))))))))))))))))))))))))))))))))))))))
