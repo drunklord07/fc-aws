@@ -4,31 +4,32 @@
 """
 AWS Full ARN Inventory — Parallel + Progress Bar (Commercial)
 - Parallel across (region × service) with bounded concurrency
-- One Excel sheet per region + "global"
+- One Excel sheet per region + a "global" sheet
 - Least-privilege list/describe calls only
-- Union of your two service lists (~90 services), nothing silently skipped
+- Union of requested services (aliases deduped)
 - Text logs: attempted_apis.txt, errors.txt, summary_counts.txt
 """
 
 from __future__ import annotations
 import os, sys, json, time, traceback, threading
 from datetime import datetime, timezone
-from typing import Dict, List, Tuple, Optional, Callable
+from typing import Dict, List, Tuple, Optional
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ------------------- CONFIG -------------------
-PROFILE_NAME = "default"              # you said you'll set this up
-ROLE_ARN = ""                         # leave blank to use profile (optional)
-EXTERNAL_ID = ""                      # optional for assume-role
+PROFILE_NAME = "default"              # uses your configured profile
+ROLE_ARN = ""                         # optional: leave blank to use profile (assume-role can be in profile)
+EXTERNAL_ID = ""                      # optional external ID if using ROLE_ARN
 SESSION_NAME = "arn-inventory-session"
 
-INCLUDE_OPT_IN_REGIONS = True         # include opt-in regions (may log OptInRequired)
-OUTPUT_XLSX = "aws-arns.xlsx"
+INCLUDE_OPT_IN_REGIONS = True         # include opt-in regions (will log OptInRequired if not enabled)
+OUTPUT_XLSX = "aws-arns3.xlsx"
 LOG_DIR = "./logs"
 
 # Parallelism / retries
-MAX_WORKERS = 24                      # global thread pool size (tune if throttling)
+CPU = os.cpu_count() or 4
+MAX_WORKERS = min(64, max(16, CPU * 4))
 REQUEST_RETRIES = 4
 BACKOFF_SECONDS = 1.0
 
@@ -63,11 +64,12 @@ GLOBAL_SERVICES = {
     "cloudfront": "us-east-1",
     "route53": "us-east-1",
     "organizations": "us-east-1",
-    "waf": "us-east-1",          # classic global
+    "waf": "us-east-1",
     "support": "us-east-1",
     "trustedadvisor": "us-east-1",
     "sts": "us-east-1",
     "budgets": "us-east-1",
+    "shield": "us-east-1",
 }
 
 FALLBACK_REGIONS = [
@@ -91,7 +93,7 @@ def utc_now(): return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 def ensure_dir(p): os.makedirs(p, exist_ok=True)
 
 def build_session(profile: str, region: Optional[str] = None):
-    """Create a fresh session per task (boto3 clients are safe, but sessions per thread is simplest)."""
+    """Create a fresh session per task."""
     if ROLE_ARN:
         base = boto3.Session(profile_name=profile) if profile else boto3.Session()
         sts = base.client("sts", region_name="us-east-1", config=BotoConfig(retries={"max_attempts": 3}))
@@ -153,24 +155,35 @@ class Sink:
         with self._lock:
             row = [region, service, rtype, arn, rid, acct, api, notes, utc_now()]
             self.rows[sheet].append(row)
-            if arn:
-                self.by_service[service] += 1
-                self.by_service_type[(service, rtype)] += 1
-                self.by_region[region] += 1
-                self.total += 1
+            if arn or notes.startswith("ERROR") or notes in ("NotApplicable","NotImplemented","TaskFailed"):
+                # Count only real ARNs for totals; but keep per-region sheet rows regardless
+                if arn:
+                    self.by_service[service] += 1
+                    self.by_service_type[(service, rtype)] += 1
+                    self.by_region[region] += 1
+                    self.total += 1
 
-def write_excel(path: str, rows_by_sheet: Dict[str, List[List[str]]]):
+def write_excel(path: str, rows_by_sheet: Dict[str, List[List[str]]], all_regions: List[str]):
     wb = Workbook()
-    default = wb.active; default.title = "global"
+    # ensure "global" exists and is first
+    ws0 = wb.active
+    ws0.title = "global"
+    # write helper
     def write_sheet(name: str, rows: List[List[str]]):
         ws = wb[name] if name in wb.sheetnames else wb.create_sheet(title=name)
-        ws.append(HEADERS)
+        if ws.max_row == 1 and ws.max_column == 1 and ws["A1"].value is None:
+            ws.append(HEADERS)
+        elif ws.max_row == 1 and ws["A1"].value != HEADERS[0]:
+            ws.delete_rows(1, ws.max_row)
+            ws.append(HEADERS)
         for r in rows: ws.append(r)
         for ci in range(1, len(HEADERS)+1):
             ws.column_dimensions[get_column_letter(ci)].width = 28
-    names = ["global"] + sorted(k for k in rows_by_sheet.keys() if k != "global")
-    for n in names:
-        write_sheet(n, rows_by_sheet.get(n, []))
+    # global first
+    write_sheet("global", rows_by_sheet.get("global", []))
+    # precreate all region sheets
+    for reg in sorted(all_regions):
+        write_sheet(reg, rows_by_sheet.get(reg, []))
     wb.save(path)
 
 def write_summary(path: str, sink: Sink):
@@ -186,10 +199,10 @@ def write_summary(path: str, sink: Sink):
     sink.write_line(path, f"\n[Account Total]\nTotal ARNs: {sink.total}")
 
 # ---------- call wrapper with retries ----------
-def call_boto(sink: Sink, client, fn_name: str, *, region: str, service: str, rtype: str, api_args: dict):
+def call_boto(sink: Sink, client_or_paginator, fn_name: str, *, region: str, service: str, rtype: str, api_args: dict):
     api = fn_name
     sink.write_line(sink.attempted, f"{utc_now()} | region={region} | service={service} | resource={rtype} | API={api} | args={json.dumps(api_args, default=str)}")
-    fn = getattr(client, fn_name)
+    fn = getattr(client_or_paginator, fn_name)
     for i in range(REQUEST_RETRIES):
         try:
             return fn(**api_args)
@@ -210,17 +223,14 @@ def call_boto(sink: Sink, client, fn_name: str, *, region: str, service: str, rt
             raise
 
 def cfg():
-    # Adaptive retry if available; increase connection pool
-    return BotoConfig(retries={"max_attempts": 10, "mode": "adaptive"}, max_pool_connections=64, user_agent_extra="arn-inventory/parallel")
+    return BotoConfig(retries={"max_attempts": 10, "mode": "adaptive"}, max_pool_connections=128, user_agent_extra="arn-inventory/parallel")
 
-# ---------- Collectors (selected: broad coverage, least-privilege) ----------
-# Many collectors are identical to the earlier version—now refactored for thread-safety and shared call_boto.
+# ---------- Collectors ----------
 
 # S3 (global list; place per-bucket in actual region)
 def c_s3(sess, sink: Sink, acct: str, part: str):
-    svc="s3"
+    svc = "s3"
     cli = sess.client("s3", region_name="us-east-1", config=cfg())
-    # list buckets
     try:
         resp = call_boto(sink, cli, "list_buckets", region="global", service=svc, rtype="buckets", api_args={})
     except Exception:
@@ -237,46 +247,33 @@ def c_s3(sess, sink: Sink, acct: str, part: str):
         except Exception:
             pass
         arn = f"arn:{part}:s3:::{name}"
-        sink.add(region if region else "global", region, svc, "bucket", arn, name, acct, "list_buckets+get_bucket_location", "" if region != "unknown" else "BucketRegionUnknown")
+        note = "" if region != "unknown" else "BucketRegionUnknown"
+        sink.add(region if region else "global", region, svc, "bucket", arn, name, acct, "list_buckets+get_bucket_location", note)
 
-# ---- Core EC2 + VPC family ----
+# EC2 (instances) and VPC family (recorded under service="vpc")
 def c_ec2(sess, sink, acct, part, region):
     cli = sess.client("ec2", region_name=region, config=cfg())
-    svc="ec2"
+    svc = "ec2"
     # instances
     try:
-        pg=cli.get_paginator("describe_instances")
+        pg = cli.get_paginator("describe_instances")
         for page in call_boto(sink, pg, "paginate", region=region, service=svc, rtype="instances", api_args={}):
             for r in page.get("Reservations", []):
                 for it in r.get("Instances", []):
-                    iid=it["InstanceId"]; arn=f"arn:{part}:ec2:{region}:{acct}:instance/{iid}"
+                    iid = it["InstanceId"]; arn = f"arn:{part}:ec2:{region}:{acct}:instance/{iid}"
                     sink.add(region, region, svc, "instance", arn, iid, acct, "describe_instances", "")
-    except Exception: pass
-    # volumes
-    try:
-        pg=cli.get_paginator("describe_volumes")
-        for page in call_boto(sink, pg, "paginate", region=region, service=svc, rtype="volumes", api_args={}):
-            for v in page.get("Volumes", []):
-                vid=v["VolumeId"]; arn=f"arn:{part}:ec2:{region}:{acct}:volume/{vid}"
-                sink.add(region, region, svc, "volume", arn, vid, acct, "describe_volumes", "")
-    except Exception: pass
-    # snapshots (owned)
-    try:
-        pg=cli.get_paginator("describe_snapshots")
-        for page in call_boto(sink, pg, "paginate", region=region, service=svc, rtype="snapshots", api_args={"OwnerIds":[acct]}):
-            for s in page.get("Snapshots", []):
-                sid=s["SnapshotId"]; arn=f"arn:{part}:ec2:{region}:{acct}:snapshot/{sid}"
-                sink.add(region, region, svc, "snapshot", arn, sid, acct, "describe_snapshots", "")
-    except Exception: pass
-    # vpc bits
-    def add(api,key,rt,id_field, arn_fmt):
+    except Exception:
+        pass
+    # vpc resources (service label "vpc")
+    def add(api, key, rt, id_field, arn_fmt):
         try:
-            pg=cli.get_paginator(api)
-            for page in call_boto(sink, pg, "paginate", region=region, service="vpc", rtype=rt, api_args={}):
+            pgx = cli.get_paginator(api)
+            for page in call_boto(sink, pgx, "paginate", region=region, service="vpc", rtype=rt, api_args={}):
                 for it in page.get(key, []):
-                    rid=it[id_field]; arn=arn_fmt.format(part=part,reg=region,acct=acct,id=rid)
+                    rid = it[id_field]; arn = arn_fmt.format(part=part, reg=region, acct=acct, id=rid)
                     sink.add(region, region, "vpc", rt, arn, rid, acct, api, "")
-        except Exception: pass
+        except Exception:
+            pass
     add("describe_vpcs","Vpcs","vpc","VpcId","arn:{part}:ec2:{reg}:{acct}:vpc/{id}")
     add("describe_subnets","Subnets","subnet","SubnetId","arn:{part}:ec2:{reg}:{acct}:subnet/{id}")
     add("describe_route_tables","RouteTables","route-table","RouteTableId","arn:{part}:ec2:{reg}:{acct}:route-table/{id}")
@@ -284,8 +281,28 @@ def c_ec2(sess, sink, acct, part, region):
     add("describe_nat_gateways","NatGateways","nat-gateway","NatGatewayId","arn:{part}:ec2:{reg}:{acct}:natgateway/{id}")
     add("describe_vpc_endpoints","VpcEndpoints","vpc-endpoint","VpcEndpointId","arn:{part}:ec2:{reg}:{acct}:vpc-endpoint/{id}")
 
-# ECR / ECS / EKS / Lambda
-def c_ecr(sess,sink,acct,part,region):
+# EBS (volumes + owned snapshots) — separate service label
+def c_ebs(sess, sink, acct, part, region):
+    cli = sess.client("ec2", region_name=region, config=cfg())
+    svc = "ebs"
+    try:
+        pg = cli.get_paginator("describe_volumes")
+        for page in call_boto(sink, pg, "paginate", region=region, service=svc, rtype="volumes", api_args={}):
+            for v in page.get("Volumes", []):
+                vid = v["VolumeId"]; arn = f"arn:{part}:ec2:{region}:{acct}:volume/{vid}"
+                sink.add(region, region, svc, "volume", arn, vid, acct, "describe_volumes", "")
+    except Exception:
+        pass
+    try:
+        pg = cli.get_paginator("describe_snapshots")
+        for page in call_boto(sink, pg, "paginate", region=region, service=svc, rtype="snapshots", api_args={"OwnerIds":[acct]}):
+            for s in page.get("Snapshots", []):
+                sid = s["SnapshotId"]; arn = f"arn:{part}:ec2:{region}:{acct}:snapshot/{sid}"
+                sink.add(region, region, svc, "snapshot", arn, sid, acct, "describe_snapshots", "")
+    except Exception:
+        pass
+
+def c_ecr(sess, sink, acct, part, region):
     svc="ecr"; cli=sess.client("ecr", region_name=region, config=cfg())
     try:
         pg=cli.get_paginator("describe_repositories")
@@ -295,7 +312,7 @@ def c_ecr(sess,sink,acct,part,region):
                 sink.add(region, region, svc, "repository", arn, name, acct, "describe_repositories", "" if arn else "NotDerivable")
     except Exception: pass
 
-def c_ecs(sess,sink,acct,part,region):
+def c_ecs(sess, sink, acct, part, region):
     svc="ecs"; cli=sess.client("ecs", region_name=region, config=cfg())
     try:
         arns = call_boto(sink, cli, "list_clusters", region=region, service=svc, rtype="clusters", api_args={}).get("clusterArns", [])
@@ -315,7 +332,7 @@ def c_ecs(sess,sink,acct,part,region):
             sink.add(region, region, svc, "task-definition", tarn, tarn.split("/")[-1], acct, "list_task_definitions", "")
     except Exception: pass
 
-def c_eks(sess,sink,acct,part,region):
+def c_eks(sess, sink, acct, part, region):
     svc="eks"; cli=sess.client("eks", region_name=region, config=cfg())
     try:
         names = call_boto(sink, cli, "list_clusters", region=region, service=svc, rtype="clusters", api_args={}).get("clusters", [])
@@ -332,7 +349,7 @@ def c_eks(sess,sink,acct,part,region):
             except Exception: pass
     except Exception: pass
 
-def c_lambda(sess,sink,acct,part,region):
+def c_lambda(sess, sink, acct, part, region):
     svc="lambda"; cli=sess.client("lambda", region_name=region, config=cfg())
     try:
         pg=cli.get_paginator("list_functions")
@@ -351,8 +368,7 @@ def c_lambda(sess,sink,acct,part,region):
                 sink.add(region, region, svc, "layer-version", larn, lname, acct, "list_layer_versions", "" if larn else "NotDerivable")
     except Exception: pass
 
-# RDS / Redshift / DynamoDB / DocDB / Neptune
-def c_rds(sess,sink,acct,part,region):
+def c_rds(sess, sink, acct, part, region):
     svc="rds"; cli=sess.client("rds", region_name=region, config=cfg())
     try:
         pg=cli.get_paginator("describe_db_instances")
@@ -369,7 +385,7 @@ def c_rds(sess,sink,acct,part,region):
                 sink.add(region, region, svc, "db-cluster", arn, name, acct, "describe_db_clusters", "" if arn else "NotDerivable")
     except Exception: pass
 
-def c_redshift(sess,sink,acct,part,region):
+def c_redshift(sess, sink, acct, part, region):
     svc="redshift"; cli=sess.client("redshift", region_name=region, config=cfg())
     try:
         pg=cli.get_paginator("describe_clusters")
@@ -380,7 +396,7 @@ def c_redshift(sess,sink,acct,part,region):
                 sink.add(region, region, svc, "cluster", arn, name, acct, "describe_clusters", "" if arn else "NotDerivable")
     except Exception: pass
 
-def c_dynamodb(sess,sink,acct,part,region):
+def c_dynamodb(sess, sink, acct, part, region):
     svc="dynamodb"; cli=sess.client("dynamodb", region_name=region, config=cfg())
     try:
         pg=cli.get_paginator("list_tables")
@@ -391,7 +407,7 @@ def c_dynamodb(sess,sink,acct,part,region):
                 sink.add(region, region, svc, "table", arn, name, acct, "describe_table", "" if arn else "NotDerivable")
     except Exception: pass
 
-def c_docdb(sess,sink,acct,part,region):
+def c_docdb(sess, sink, acct, part, region):
     svc="docdb"; cli=sess.client("docdb", region_name=region, config=cfg())
     try:
         resp = call_boto(sink, cli, "describe_db_clusters", region=region, service=svc, rtype="db-clusters", api_args={})
@@ -400,7 +416,7 @@ def c_docdb(sess,sink,acct,part,region):
             sink.add(region, region, svc, "db-cluster", arn, name, acct, "describe_db_clusters", "" if arn else "NotDerivable")
     except Exception: pass
 
-def c_neptune(sess,sink,acct,part,region):
+def c_neptune(sess, sink, acct, part, region):
     svc="neptune"; cli=sess.client("neptune", region_name=region, config=cfg())
     try:
         resp = call_boto(sink, cli, "describe_db_clusters", region=region, service=svc, rtype="db-clusters", api_args={})
@@ -409,8 +425,7 @@ def c_neptune(sess,sink,acct,part,region):
             sink.add(region, region, svc, "db-cluster", arn, name, acct, "describe_db_clusters", "" if arn else "NotDerivable")
     except Exception: pass
 
-# Filesystems
-def c_efs(sess,sink,acct,part,region):
+def c_efs(sess, sink, acct, part, region):
     svc="efs"; cli=sess.client("efs", region_name=region, config=cfg())
     try:
         pg=cli.get_paginator("describe_file_systems")
@@ -420,7 +435,7 @@ def c_efs(sess,sink,acct,part,region):
                 sink.add(region, region, svc, "file-system", arn, fid, acct, "describe_file_systems", "" if arn else "NotDerivable")
     except Exception: pass
 
-def c_fsx(sess,sink,acct,part,region):
+def c_fsx(sess, sink, acct, part, region):
     svc="fsx"; cli=sess.client("fsx", region_name=region, config=cfg())
     try:
         pg=cli.get_paginator("describe_file_systems")
@@ -430,8 +445,7 @@ def c_fsx(sess,sink,acct,part,region):
                 sink.add(region, region, svc, "file-system", arn, name, acct, "describe_file_systems", "" if arn else "NotDerivable")
     except Exception: pass
 
-# Load balancers
-def c_elb(sess,sink,acct,part,region):
+def c_elb(sess, sink, acct, part, region):
     svc="elb"; cli=sess.client("elb", region_name=region, config=cfg())
     try:
         pg=cli.get_paginator("describe_load_balancers")
@@ -442,7 +456,7 @@ def c_elb(sess,sink,acct,part,region):
                 sink.add(region, region, svc, "load-balancer", arn, name, acct, "describe_load_balancers", "")
     except Exception: pass
 
-def c_elbv2(sess,sink,acct,part,region):
+def c_elbv2(sess, sink, acct, part, region):
     svc="elbv2"; cli=sess.client("elbv2", region_name=region, config=cfg())
     try:
         pg=cli.get_paginator("describe_load_balancers")
@@ -452,8 +466,7 @@ def c_elbv2(sess,sink,acct,part,region):
                 sink.add(region, region, svc, "load-balancer", arn, name, acct, "describe_load_balancers", "" if arn else "NotDerivable")
     except Exception: pass
 
-# API Gateway
-def c_apigw(sess,sink,acct,part,region):
+def c_apigw(sess, sink, acct, part, region):
     svc="apigateway"; cli=sess.client("apigateway", region_name=region, config=cfg())
     try:
         pg=cli.get_paginator("get_rest_apis")
@@ -463,7 +476,7 @@ def c_apigw(sess,sink,acct,part,region):
                 sink.add(region, region, svc, "rest-api", arn, it.get("name",api_id), acct, "get_rest_apis", "")
     except Exception: pass
 
-def c_apigw2(sess,sink,acct,part,region):
+def c_apigw2(sess, sink, acct, part, region):
     svc="apigatewayv2"; cli=sess.client("apigatewayv2", region_name=region, config=cfg())
     try:
         pg=cli.get_paginator("get_apis")
@@ -473,8 +486,7 @@ def c_apigw2(sess,sink,acct,part,region):
                 sink.add(region, region, svc, "api", arn, it.get("Name",api_id), acct, "get_apis", "")
     except Exception: pass
 
-# Glue / Athena / CloudTrail / CloudFormation / CloudWatch+Logs
-def c_glue(sess,sink,acct,part,region):
+def c_glue(sess, sink, acct, part, region):
     svc="glue"; cli=sess.client("glue", region_name=region, config=cfg())
     try:
         pg=cli.get_paginator("get_crawlers")
@@ -499,7 +511,7 @@ def c_glue(sess,sink,acct,part,region):
                 sink.add(region, region, svc, "database", arn, name, acct, "get_databases", "" if arn else "NotDerivable")
     except Exception: pass
 
-def c_athena(sess,sink,acct,part,region):
+def c_athena(sess, sink, acct, part, region):
     svc="athena"; cli=sess.client("athena", region_name=region, config=cfg())
     try:
         resp=call_boto(sink, cli, "list_work_groups", region=region, service=svc, rtype="workgroups", api_args={})
@@ -508,7 +520,7 @@ def c_athena(sess,sink,acct,part,region):
             sink.add(region, region, svc, "workgroup", arn, name, acct, "list_work_groups", "" if arn else "NotDerivable")
     except Exception: pass
 
-def c_cloudtrail(sess,sink,acct,part,region):
+def c_cloudtrail(sess, sink, acct, part, region):
     svc="cloudtrail"; cli=sess.client("cloudtrail", region_name=region, config=cfg())
     try:
         resp = call_boto(sink, cli, "list_trails", region=region, service=svc, rtype="trails", api_args={})
@@ -517,7 +529,7 @@ def c_cloudtrail(sess,sink,acct,part,region):
             sink.add(region, region, svc, "trail", arn, name, acct, "list_trails", "" if arn else "NotDerivable")
     except Exception: pass
 
-def c_cfn(sess,sink,acct,part,region):
+def c_cfn(sess, sink, acct, part, region):
     svc="cloudformation"; cli=sess.client("cloudformation", region_name=region, config=cfg())
     try:
         pg=cli.get_paginator("list_stacks")
@@ -528,7 +540,7 @@ def c_cfn(sess,sink,acct,part,region):
                 sink.add(region, region, svc, "stack", arn, name, acct, "list_stacks", "" if arn else "NotDerivable")
     except Exception: pass
 
-def c_cloudwatch(sess,sink,acct,part,region):
+def c_cloudwatch(sess, sink, acct, part, region):
     svc="cloudwatch"; cli=sess.client("cloudwatch", region_name=region, config=cfg())
     try:
         pg=cli.get_paginator("describe_alarms")
@@ -536,9 +548,12 @@ def c_cloudwatch(sess,sink,acct,part,region):
             for a in page.get("MetricAlarms", []):
                 arn=a.get("AlarmArn",""); name=a.get("AlarmName","")
                 sink.add(region, region, svc, "alarm", arn, name, acct, "describe_alarms", "" if arn else "NotDerivable")
+            for a in page.get("CompositeAlarms", []):
+                arn=a.get("AlarmArn",""); name=a.get("AlarmName","")
+                sink.add(region, region, svc, "composite-alarm", arn, name, acct, "describe_alarms", "" if arn else "NotDerivable")
     except Exception: pass
 
-def c_logs(sess,sink,acct,part,region):
+def c_logs(sess, sink, acct, part, region):
     svc="logs"; cli=sess.client("logs", region_name=region, config=cfg())
     try:
         pg=cli.get_paginator("describe_log_groups")
@@ -548,8 +563,7 @@ def c_logs(sess,sink,acct,part,region):
                 sink.add(region, region, svc, "log-group", arn, name, acct, "describe_log_groups", "" if arn else "NotDerivable")
     except Exception: pass
 
-# KMS / Secrets / SNS / SQS
-def c_kms(sess,sink,acct,part,region):
+def c_kms(sess, sink, acct, part, region):
     svc="kms"; cli=sess.client("kms", region_name=region, config=cfg())
     try:
         pg=cli.get_paginator("list_keys")
@@ -568,7 +582,7 @@ def c_kms(sess,sink,acct,part,region):
                 sink.add(region, region, svc, "alias", arn, name, acct, "list_aliases", "" if arn else "NotDerivable")
     except Exception: pass
 
-def c_secrets(sess,sink,acct,part,region):
+def c_secrets(sess, sink, acct, part, region):
     svc="secretsmanager"; cli=sess.client("secretsmanager", region_name=region, config=cfg())
     try:
         pg=cli.get_paginator("list_secrets")
@@ -578,7 +592,7 @@ def c_secrets(sess,sink,acct,part,region):
                 sink.add(region, region, svc, "secret", arn, name, acct, "list_secrets", "" if arn else "NotDerivable")
     except Exception: pass
 
-def c_sns(sess,sink,acct,part,region):
+def c_sns(sess, sink, acct, part, region):
     svc="sns"; cli=sess.client("sns", region_name=region, config=cfg())
     try:
         pg=cli.get_paginator("list_topics")
@@ -587,7 +601,7 @@ def c_sns(sess,sink,acct,part,region):
                 arn=t.get("TopicArn",""); sink.add(region, region, svc, "topic", arn, arn.split(":")[-1], acct, "list_topics", "" if arn else "NotDerivable")
     except Exception: pass
 
-def c_sqs(sess,sink,acct,part,region):
+def c_sqs(sess, sink, acct, part, region):
     svc="sqs"; cli=sess.client("sqs", region_name=region, config=cfg())
     try:
         resp = call_boto(sink, cli, "list_queues", region=region, service=svc, rtype="queues", api_args={})
@@ -597,8 +611,7 @@ def c_sqs(sess,sink,acct,part,region):
             sink.add(region, region, svc, "queue", arn, name, acct, "list_queues+get_queue_attributes", "" if arn else "NotDerivable")
     except Exception: pass
 
-
-def c_transfer(sess,sink,acct,part,region):
+def c_transfer(sess, sink, acct, part, region):
     svc="transfer"; cli=sess.client("transfer", region_name=region, config=cfg())
     try:
         pg=cli.get_paginator("list_servers")
@@ -608,8 +621,7 @@ def c_transfer(sess,sink,acct,part,region):
                 sink.add(region, region, svc, "server", arn, sid, acct, "list_servers", "" if arn else "NotDerivable")
     except Exception: pass
 
-# Security & governance
-def c_guardduty(sess,sink,acct,part,region):
+def c_guardduty(sess, sink, acct, part, region):
     svc="guardduty"; cli=sess.client("guardduty", region_name=region, config=cfg())
     try:
         dets = call_boto(sink, cli, "list_detectors", region=region, service=svc, rtype="detectors", api_args={}).get("DetectorIds", [])
@@ -618,7 +630,7 @@ def c_guardduty(sess,sink,acct,part,region):
             sink.add(region, region, svc, "detector", arn, d, acct, "list_detectors", "")
     except Exception: pass
 
-def c_securityhub(sess,sink,acct,part,region):
+def c_securityhub(sess, sink, acct, part, region):
     svc="securityhub"; cli=sess.client("securityhub", region_name=region, config=cfg())
     try:
         h = call_boto(sink, cli, "describe_hub", region=region, service=svc, rtype="hub", api_args={})
@@ -627,7 +639,7 @@ def c_securityhub(sess,sink,acct,part,region):
     except botocore.exceptions.ClientError: pass
     except Exception: pass
 
-def c_events(sess,sink,acct,part,region):
+def c_events(sess, sink, acct, part, region):
     svc="eventbridge"; cli=sess.client("events", region_name=region, config=cfg())
     try:
         resp = call_boto(sink, cli, "list_event_buses", region=region, service=svc, rtype="event-buses", api_args={})
@@ -643,7 +655,7 @@ def c_events(sess,sink,acct,part,region):
                 sink.add(region, region, svc, "rule", arn, name, acct, "list_rules", "" if arn else "NotDerivable")
     except Exception: pass
 
-def c_wafv2(sess,sink,acct,part,region):
+def c_wafv2(sess, sink, acct, part, region):
     svc="wafv2"; cli=sess.client("wafv2", region_name=region, config=cfg())
     try:
         pg=cli.get_paginator("list_web_acls")
@@ -652,16 +664,17 @@ def c_wafv2(sess,sink,acct,part,region):
                 arn=it.get("ARN",""); name=it.get("Name","")
                 sink.add(region, region, svc, "web-acl", arn, name, acct, "list_web_acls(REGIONAL)", "" if arn else "NotDerivable")
     except Exception: pass
-    # CLOUDFRONT scope (global)
+    # CLOUDFRONT scope (global, must use us-east-1)
     try:
-        pg=cli.get_paginator("list_web_acls")
+        cli_cf = sess.client("wafv2", region_name="us-east-1", config=cfg())
+        pg = cli_cf.get_paginator("list_web_acls")
         for page in call_boto(sink, pg, "paginate", region="global", service=svc, rtype="web-acls", api_args={"Scope": "CLOUDFRONT"}):
             for it in page.get("WebACLs", []):
                 arn=it.get("ARN",""); name=it.get("Name","")
                 sink.add("global", "global", svc, "web-acl", arn, name, acct, "list_web_acls(CLOUDFRONT)", "" if arn else "NotDerivable")
     except Exception: pass
 
-def c_networkfirewall(sess,sink,acct,part,region):
+def c_networkfirewall(sess, sink, acct, part, region):
     svc="networkfirewall"; cli=sess.client("networkfirewall", region_name=region, config=cfg())
     try:
         pg=cli.get_paginator("list_firewalls")
@@ -671,7 +684,7 @@ def c_networkfirewall(sess,sink,acct,part,region):
                 sink.add(region, region, svc, "firewall", arn, name, acct, "list_firewalls", "" if arn else "NotDerivable")
     except Exception: pass
 
-def c_accessanalyzer(sess,sink,acct,part,region):
+def c_accessanalyzer(sess, sink, acct, part, region):
     svc="accessanalyzer"; cli=sess.client("accessanalyzer", region_name=region, config=cfg())
     try:
         resp=call_boto(sink, cli, "list_analyzers", region=region, service=svc, rtype="analyzers", api_args={})
@@ -680,7 +693,7 @@ def c_accessanalyzer(sess,sink,acct,part,region):
             sink.add(region, region, svc, "analyzer", arn, name, acct, "list_analyzers", "" if arn else "NotDerivable")
     except Exception: pass
 
-def c_inspector(sess,sink,acct,part,region):
+def c_inspector(sess, sink, acct, part, region):
     svc="inspector"; cli=sess.client("inspector", region_name=region, config=cfg())
     try:
         resp = call_boto(sink, cli, "list_assessment_templates", region=region, service=svc, rtype="assessment-templates", api_args={})
@@ -688,7 +701,7 @@ def c_inspector(sess,sink,acct,part,region):
             sink.add(region, region, svc, "assessment-template", a, a.split("/")[-1], acct, "list_assessment_templates", "")
     except Exception: pass
 
-def c_inspector2(sess,sink,acct,part,region):
+def c_inspector2(sess, sink, acct, part, region):
     svc="inspector2"; cli=sess.client("inspector2", region_name=region, config=cfg())
     try:
         resp=call_boto(sink, cli, "list_filters", region=region, service=svc, rtype="filters", api_args={})
@@ -697,7 +710,7 @@ def c_inspector2(sess,sink,acct,part,region):
             sink.add(region, region, svc, "filter", arn, name, acct, "list_filters", "" if arn else "NotDerivable")
     except Exception: pass
 
-def c_kafka(sess,sink,acct,part,region):
+def c_kafka(sess, sink, acct, part, region):
     svc="kafka"; cli=sess.client("kafka", region_name=region, config=cfg())
     try:
         resp=call_boto(sink, cli, "list_clusters_v2", region=region, service=svc, rtype="clusters", api_args={})
@@ -706,10 +719,7 @@ def c_kafka(sess,sink,acct,part,region):
             sink.add(region, region, svc, "cluster", arn, name, acct, "list_clusters_v2", "" if arn else "NotDerivable")
     except Exception: pass
 
-def c_msk(sess,sink,acct,part,region):  # alias to kafka
-    return c_kafka(sess,sink,acct,part,region)
-
-def c_kinesis(sess,sink,acct,part,region):
+def c_kinesis(sess, sink, acct, part, region):
     svc="kinesis"; cli=sess.client("kinesis", region_name=region, config=cfg())
     try:
         pg=cli.get_paginator("list_streams")
@@ -720,7 +730,7 @@ def c_kinesis(sess,sink,acct,part,region):
                 sink.add(region, region, svc, "stream", arn, name, acct, "describe_stream_summary", "" if arn else "NotDerivable")
     except Exception: pass
 
-def c_firehose(sess,sink,acct,part,region):
+def c_firehose(sess, sink, acct, part, region):
     svc="firehose"; cli=sess.client("firehose", region_name=region, config=cfg())
     try:
         pg=cli.get_paginator("list_delivery_streams")
@@ -731,7 +741,7 @@ def c_firehose(sess,sink,acct,part,region):
                 sink.add(region, region, svc, "delivery-stream", arn, name, acct, "describe_delivery_stream", "" if arn else "NotDerivable")
     except Exception: pass
 
-def c_acm(sess,sink,acct,part,region):
+def c_acm(sess, sink, acct, part, region):
     svc="acm"; cli=sess.client("acm", region_name=region, config=cfg())
     try:
         pg=cli.get_paginator("list_certificates")
@@ -741,7 +751,7 @@ def c_acm(sess,sink,acct,part,region):
                 sink.add(region, region, svc, "certificate", arn, name, acct, "list_certificates", "" if arn else "NotDerivable")
     except Exception: pass
 
-def c_appconfig(sess,sink,acct,part,region):
+def c_appconfig(sess, sink, acct, part, region):
     svc="appconfig"; cli=sess.client("appconfig", region_name=region, config=cfg())
     try:
         pg=cli.get_paginator("list_applications")
@@ -763,7 +773,7 @@ def c_appconfig(sess,sink,acct,part,region):
             except Exception: pass
     except Exception: pass
 
-def c_appstream(sess,sink,acct,part,region):
+def c_appstream(sess, sink, acct, part, region):
     svc="appstream"; cli=sess.client("appstream", region_name=region, config=cfg())
     try:
         pg=cli.get_paginator("describe_stacks")
@@ -780,7 +790,7 @@ def c_appstream(sess,sink,acct,part,region):
                 sink.add(region, region, svc, "fleet", arn, name, acct, "describe_fleets", "" if arn else "NotDerivable")
     except Exception: pass
 
-def c_appsync(sess,sink,acct,part,region):
+def c_appsync(sess, sink, acct, part, region):
     svc="appsync"; cli=sess.client("appsync", region_name=region, config=cfg())
     try:
         pg=cli.get_paginator("list_graphql_apis")
@@ -790,7 +800,7 @@ def c_appsync(sess,sink,acct,part,region):
                 sink.add(region, region, svc, "graphql-api", arn, name, acct, "list_graphql_apis", "" if arn else "NotDerivable")
     except Exception: pass
 
-def c_auditmanager(sess,sink,acct,part,region):
+def c_auditmanager(sess, sink, acct, part, region):
     svc="auditmanager"; cli=sess.client("auditmanager", region_name=region, config=cfg())
     try:
         pg=cli.get_paginator("list_assessments")
@@ -800,7 +810,7 @@ def c_auditmanager(sess,sink,acct,part,region):
                 sink.add(region, region, svc, "assessment", arn, name, acct, "list_assessments", "" if arn else "NotDerivable")
     except Exception: pass
 
-def c_autoscaling(sess,sink,acct,part,region):
+def c_autoscaling(sess, sink, acct, part, region):
     svc="autoscaling"; cli=sess.client("autoscaling", region_name=region, config=cfg())
     try:
         pg=cli.get_paginator("describe_auto_scaling_groups")
@@ -810,7 +820,7 @@ def c_autoscaling(sess,sink,acct,part,region):
                 sink.add(region, region, svc, "auto-scaling-group", arn, name, acct, "describe_auto_scaling_groups", "" if arn else "NotDerivable")
     except Exception: pass
 
-def c_backup(sess,sink,acct,part,region):
+def c_backup(sess, sink, acct, part, region):
     svc="backup"; cli=sess.client("backup", region_name=region, config=cfg())
     try:
         pg=cli.get_paginator("list_backup_vaults")
@@ -820,7 +830,7 @@ def c_backup(sess,sink,acct,part,region):
                 sink.add(region, region, svc, "backup-vault", arn, name, acct, "list_backup_vaults", "" if arn else "NotDerivable")
     except Exception: pass
 
-def c_batch(sess,sink,acct,part,region):
+def c_batch(sess, sink, acct, part, region):
     svc="batch"; cli=sess.client("batch", region_name=region, config=cfg())
     try:
         resp=call_boto(sink, cli, "describe_job_queues", region=region, service=svc, rtype="job-queues", api_args={})
@@ -841,9 +851,8 @@ def c_batch(sess,sink,acct,part,region):
             sink.add(region, region, svc, "job-definition", arn, name, acct, "describe_job_definitions", "" if arn else "NotDerivable")
     except Exception: pass
 
-def c_bedrock(sess,sink,acct,part,region):
+def c_bedrock(sess, sink, acct, part, region):
     svc="bedrock"
-    # bedrock-agent surfaces listable ARNs (agents, knowledge bases)
     try:
         cli=sess.client("bedrock-agent", region_name=region, config=cfg())
         resp=call_boto(sink, cli, "list_agents", region=region, service=svc, rtype="agents", api_args={})
@@ -856,7 +865,7 @@ def c_bedrock(sess,sink,acct,part,region):
             sink.add(region, region, svc, "knowledge-base", arn, name, acct, "list_knowledge_bases", "" if arn else "NotDerivable")
     except Exception: pass
 
-def c_cognito(sess,sink,acct,part,region):
+def c_cognito(sess, sink, acct, part, region):
     # user pools
     try:
         cli=sess.client("cognito-idp", region_name=region, config=cfg())
@@ -877,7 +886,7 @@ def c_cognito(sess,sink,acct,part,region):
             sink.add(region, region, "cognito", "identity-pool", arn, name or pid, acct, "list_identity_pools", "" if arn else "NotDerivable")
     except Exception: pass
 
-def c_config(sess,sink,acct,part,region):
+def c_config(sess, sink, acct, part, region):
     svc="config"; cli=sess.client("config", region_name=region, config=cfg())
     try:
         pg=cli.get_paginator("describe_config_rules")
@@ -887,7 +896,7 @@ def c_config(sess,sink,acct,part,region):
                 sink.add(region, region, svc, "config-rule", arn, name, acct, "describe_config_rules", "" if arn else "NotDerivable")
     except Exception: pass
 
-def c_detective(sess,sink,acct,part,region):
+def c_detective(sess, sink, acct, part, region):
     svc="detective"; cli=sess.client("detective", region_name=region, config=cfg())
     try:
         resp=call_boto(sink, cli, "list_graphs", region=region, service=svc, rtype="graphs", api_args={})
@@ -896,7 +905,7 @@ def c_detective(sess,sink,acct,part,region):
             sink.add(region, region, svc, "graph", arn, name, acct, "list_graphs", "" if arn else "NotDerivable")
     except Exception: pass
 
-def c_directconnect(sess,sink,acct,part,region):
+def c_directconnect(sess, sink, acct, part, region):
     svc="directconnect"; cli=sess.client("directconnect", region_name=region, config=cfg())
     try:
         resp=call_boto(sink, cli, "describe_connections", region=region, service=svc, rtype="connections", api_args={})
@@ -905,7 +914,7 @@ def c_directconnect(sess,sink,acct,part,region):
             sink.add(region, region, svc, "connection", "", cid, acct, "describe_connections", "NotDerivable")
     except Exception: pass
 
-def c_directoryservice(sess,sink,acct,part,region):
+def c_directoryservice(sess, sink, acct, part, region):
     svc="directoryservice"; cli=sess.client("ds", region_name=region, config=cfg())
     try:
         resp=call_boto(sink, cli, "describe_directories", region=region, service=svc, rtype="directories", api_args={})
@@ -915,7 +924,7 @@ def c_directoryservice(sess,sink,acct,part,region):
             sink.add(region, region, svc, "directory", arn, name or did, acct, "describe_directories", "" if arn else "NotDerivable")
     except Exception: pass
 
-def c_datasync(sess,sink,acct,part,region):
+def c_datasync(sess, sink, acct, part, region):
     svc="datasync"; cli=sess.client("datasync", region_name=region, config=cfg())
     for spec in [("list_agents","Agents","agent","Arn","Name"),
                  ("list_locations","Locations","location","LocationArn","LocationUri"),
@@ -929,7 +938,7 @@ def c_datasync(sess,sink,acct,part,region):
                     sink.add(region, region, svc, rtype, arn, rid, acct, api, "" if arn else "NotDerivable")
         except Exception: pass
 
-def c_dlm(sess,sink,acct,part,region):
+def c_dlm(sess, sink, acct, part, region):
     svc="dlm"; cli=sess.client("dlm", region_name=region, config=cfg())
     try:
         resp=call_boto(sink, cli, "get_lifecycle_policies", region=region, service=svc, rtype="policies", api_args={})
@@ -938,7 +947,7 @@ def c_dlm(sess,sink,acct,part,region):
             sink.add(region, region, svc, "policy", arn, pid, acct, "get_lifecycle_policies", "" if arn else "NotDerivable")
     except Exception: pass
 
-def c_dms(sess,sink,acct,part,region):
+def c_dms(sess, sink, acct, part, region):
     svc="dms"; cli=sess.client("dms", region_name=region, config=cfg())
     for api,rtype,key,arnk,idk in [
         ("describe_replication_instances","replication-instances","ReplicationInstances","ReplicationInstanceArn","ReplicationInstanceIdentifier"),
@@ -952,38 +961,40 @@ def c_dms(sess,sink,acct,part,region):
                 sink.add(region, region, svc, rtype, arn, rid, acct, api, "" if arn else "NotDerivable")
         except Exception: pass
 
-def c_drs(sess,sink,acct,part,region):
+def c_drs(sess, sink, acct, part, region):
     svc="drs"; cli=sess.client("drs", region_name=region, config=cfg())
     try:
         resp=call_boto(sink, cli, "describe_source_servers", region=region, service=svc, rtype="source-servers", api_args={})
         for s in resp.get("items", []):
-            arn = s.get("arn") or s.get("sourceServerID") or ""
-            is_arn = str(arn).startswith("arn:")
-            sink.add(region, region, svc, "source-server", arn if is_arn else "", s.get("sourceServerID",""), acct, "describe_source_servers", "" if is_arn else "NotDerivable")
+            arn = s.get("arn")
+            if arn and str(arn).startswith("arn:"):
+                sink.add(region, region, svc, "source-server", arn, s.get("sourceServerID",""), acct, "describe_source_servers", "")
+            else:
+                sink.add(region, region, svc, "source-server", "", s.get("sourceServerID",""), acct, "describe_source_servers", "NotDerivable")
     except Exception: pass
     try:
         resp=call_boto(sink, cli, "list_replication_configuration_templates", region=region, service=svc, rtype="replication-config-templates", api_args={})
         for t in resp.get("items", []):
-            arn=t.get("arn",""); name=t.get("stagingAreaSubnetId","") or t.get("arn","").split("/")[-1]
+            arn=t.get("arn",""); name=t.get("arn","").split("/")[-1]
             sink.add(region, region, svc, "replication-config-template", arn, name, acct, "list_replication_configuration_templates", "" if arn else "NotDerivable")
     except Exception: pass
 
-def c_elasticache(sess,sink,acct,part,region):
+def c_elasticache(sess, sink, acct, part, region):
     svc="elasticache"; cli=sess.client("elasticache", region_name=region, config=cfg())
     try:
         resp=call_boto(sink, cli, "describe_replication_groups", region=region, service=svc, rtype="replication-groups", api_args={})
         for g in resp.get("ReplicationGroups", []):
-            rid=g.get("ReplicationGroupId",""); arn=g.get("ARN") or f"arn:{part}:elasticache:{region}:{acct}:replicationgroup:{rid}" if rid else ""
+            rid=g.get("ReplicationGroupId",""); arn=g.get("ARN") or (f"arn:{part}:elasticache:{region}:{acct}:replicationgroup:{rid}" if rid else "")
             sink.add(region, region, svc, "replication-group", arn, rid, acct, "describe_replication_groups", "" if arn else "NotDerivable")
     except Exception: pass
     try:
         resp=call_boto(sink, cli, "describe_cache_clusters", region=region, service=svc, rtype="cache-clusters", api_args={})
         for c in resp.get("CacheClusters", []):
-            cid=c.get("CacheClusterId",""); arn=c.get("ARN") or f"arn:{part}:elasticache:{region}:{acct}:cluster:{cid}" if cid else ""
+            cid=c.get("CacheClusterId",""); arn=c.get("ARN") or (f"arn:{part}:elasticache:{region}:{acct}:cluster:{cid}" if cid else "")
             sink.add(region, region, svc, "cache-cluster", arn, cid, acct, "describe_cache_clusters", "" if arn else "NotDerivable")
     except Exception: pass
 
-def c_fms(sess,sink,acct,part,region):
+def c_fms(sess, sink, acct, part, region):
     svc="fms"; cli=sess.client("fms", region_name=region, config=cfg())
     try:
         resp=call_boto(sink, cli, "list_policies", region=region, service=svc, rtype="policies", api_args={})
@@ -993,17 +1004,15 @@ def c_fms(sess,sink,acct,part,region):
     except Exception: pass
 
 def c_lightsail(sess, sink, acct, part, region):
-    svc = "lightsail"
-    cli = sess.client("lightsail", region_name=region, config=cfg())
+    svc="lightsail"; cli=sess.client("lightsail", region_name=region, config=cfg())
     try:
-        resp = call_boto(sink, cli, "get_instances", region=region, service=svc, rtype="instances", api_args={})
+        resp=call_boto(sink, cli, "get_instances", region=region, service=svc, rtype="instances", api_args={})
         for i in resp.get("instances", []):
-            arn = i.get("arn",""); name = i.get("name","")
+            arn=i.get("arn",""); name=i.get("name","")
             sink.add(region, region, svc, "instance", arn, name, acct, "get_instances", "" if arn else "NotDerivable")
-    except Exception:
-        pass
+    except Exception: pass
 
-def c_macie(sess,sink,acct,part,region):
+def c_macie(sess, sink, acct, part, region):
     svc="macie"; cli=sess.client("macie2", region_name=region, config=cfg())
     try:
         resp=call_boto(sink, cli, "get_macie_session", region=region, service=svc, rtype="session", api_args={})
@@ -1011,7 +1020,7 @@ def c_macie(sess,sink,acct,part,region):
         sink.add(region, region, svc, "session", "", status, acct, "get_macie_session", "NotDerivable")
     except Exception: pass
 
-def c_mq(sess,sink,acct,part,region):
+def c_mq(sess, sink, acct, part, region):
     svc="mq"; cli=sess.client("mq", region_name=region, config=cfg())
     try:
         resp=call_boto(sink, cli, "list_brokers", region=region, service=svc, rtype="brokers", api_args={})
@@ -1020,7 +1029,7 @@ def c_mq(sess,sink,acct,part,region):
             sink.add(region, region, svc, "broker", arn, name, acct, "list_brokers", "" if arn else "NotDerivable")
     except Exception: pass
 
-def c_opensearch(sess,sink,acct,part,region):
+def c_opensearch(sess, sink, acct, part, region):
     svc="opensearch"; cli=sess.client("opensearch", region_name=region, config=cfg())
     try:
         resp=call_boto(sink, cli, "list_domain_names", region=region, service=svc, rtype="domains", api_args={})
@@ -1031,7 +1040,7 @@ def c_opensearch(sess,sink,acct,part,region):
             sink.add(region, region, svc, "domain", arn, name, acct, "describe_domain", "" if arn else "NotDerivable")
     except Exception: pass
 
-def c_ram(sess,sink,acct,part,region):
+def c_ram(sess, sink, acct, part, region):
     svc="ram"; cli=sess.client("ram", region_name=region, config=cfg())
     try:
         resp=call_boto(sink, cli, "list_resource_shares", region=region, service=svc, rtype="resource-shares", api_args={"resourceOwner":"SELF"})
@@ -1046,7 +1055,7 @@ def c_ram(sess,sink,acct,part,region):
             sink.add(region, region, svc, "shared-resource", arn, name, acct, "list_resources", "" if arn else "NotDerivable")
     except Exception: pass
 
-def c_resourceexplorer2(sess,sink,acct,part,region):
+def c_resourceexplorer2(sess, sink, acct, part, region):
     svc="resourceexplorer2"; cli=sess.client("resource-explorer-2", region_name=region, config=cfg())
     try:
         resp=call_boto(sink, cli, "list_views", region=region, service=svc, rtype="views", api_args={})
@@ -1061,7 +1070,7 @@ def c_resourceexplorer2(sess,sink,acct,part,region):
             sink.add(region, region, svc, "index", arn, name, acct, "list_indexes", "" if arn else "NotDerivable")
     except Exception: pass
 
-def c_route53resolver(sess,sink,acct,part,region):
+def c_route53resolver(sess, sink, acct, part, region):
     svc="route53resolver"; cli=sess.client("route53resolver", region_name=region, config=cfg())
     for spec in [("list_resolver_endpoints","ResolverEndpoints","resolver-endpoint","Arn","Name"),
                  ("list_resolver_rules","ResolverRules","resolver-rule","Arn","Name")]:
@@ -1073,7 +1082,7 @@ def c_route53resolver(sess,sink,acct,part,region):
                     sink.add(region, region, svc, rtype, arn, name, acct, api, "" if arn else "NotDerivable")
         except Exception: pass
 
-def c_sagemaker(sess,sink,acct,part,region):
+def c_sagemaker(sess, sink, acct, part, region):
     svc="sagemaker"; cli=sess.client("sagemaker", region_name=region, config=cfg())
     try:
         pg=cli.get_paginator("list_endpoints")
@@ -1108,7 +1117,7 @@ def c_sagemaker(sess,sink,acct,part,region):
                 sink.add(region, region, svc, "training-job", arn, name, acct, "describe_training_job", "" if arn else "NotDerivable")
     except Exception: pass
 
-def c_ses(sess,sink,acct,part,region):
+def c_ses(sess, sink, acct, part, region):
     svc="ses"; cli=sess.client("sesv2", region_name=region, config=cfg())
     try:
         pg=cli.get_paginator("list_email_identities")
@@ -1118,18 +1127,21 @@ def c_ses(sess,sink,acct,part,region):
                 sink.add(region, region, svc, "email-identity", "", name, acct, "list_email_identities", "NotDerivable")
     except Exception: pass
 
-def c_shield(sess,sink,acct,part,region):
+def c_shield(sess, sink, acct, part, region):
     svc="shield"
     try:
-        cli=sess.client("shield", region_name=region, config=cfg())
-        resp=call_boto(sink, cli, "list_protections", region=region, service=svc, rtype="protections", api_args={})
+        cli=sess.client("shield", region_name="us-east-1", config=cfg())
+        resp=call_boto(sink, cli, "list_protections", region="global", service=svc, rtype="protections", api_args={})
         for p in resp.get("Protections", []) or []:
             arn = p.get("ProtectionArn") or p.get("ResourceArn","")
             name=p.get("Name","")
-            sink.add(region, region, svc, "protection", arn if str(arn).startswith("arn:") else "", name, acct, "list_protections", "" if (arn and str(arn).startswith('arn:')) else "NotDerivable")
+            if arn and str(arn).startswith("arn:"):
+                sink.add("global","global",svc,"protection", arn, name, acct, "list_protections", "")
+            else:
+                sink.add("global","global",svc,"protection", "", name, acct, "list_protections", "NotDerivable")
     except Exception: pass
 
-def c_ssm(sess,sink,acct,part,region):
+def c_ssm(sess, sink, acct, part, region):
     svc="ssm"; cli=sess.client("ssm", region_name=region, config=cfg())
     try:
         pg=cli.get_paginator("describe_parameters")
@@ -1139,7 +1151,7 @@ def c_ssm(sess,sink,acct,part,region):
                 sink.add(region, region, svc, "parameter", arn if arn else "", name, acct, "describe_parameters", "" if arn else "NotDerivable")
     except Exception: pass
 
-def c_ssmcontacts(sess,sink,acct,part,region):
+def c_ssmcontacts(sess, sink, acct, part, region):
     svc="ssmcontacts"; cli=sess.client("ssm-contacts", region_name=region, config=cfg())
     try:
         pg=cli.get_paginator("list_contacts")
@@ -1149,7 +1161,7 @@ def c_ssmcontacts(sess,sink,acct,part,region):
                 sink.add(region, region, svc, "contact", arn, alias, acct, "list_contacts", "" if arn else "NotDerivable")
     except Exception: pass
 
-def c_ssmincidents(sess,sink,acct,part,region):
+def c_ssmincidents(sess, sink, acct, part, region):
     svc="ssmincidents"; cli=sess.client("ssm-incidents", region_name=region, config=cfg())
     try:
         pg=cli.get_paginator("list_response_plans")
@@ -1159,7 +1171,7 @@ def c_ssmincidents(sess,sink,acct,part,region):
                 sink.add(region, region, svc, "response-plan", arn, name, acct, "list_response_plans", "" if arn else "NotDerivable")
     except Exception: pass
 
-def c_stepfunctions(sess,sink,acct,part,region):
+def c_stepfunctions(sess, sink, acct, part, region):
     svc="stepfunctions"; cli=sess.client("stepfunctions", region_name=region, config=cfg())
     try:
         resp=call_boto(sink, cli, "list_state_machines", region=region, service=svc, rtype="state-machines", api_args={})
@@ -1168,7 +1180,7 @@ def c_stepfunctions(sess,sink,acct,part,region):
             sink.add(region, region, svc, "state-machine", arn, name, acct, "list_state_machines", "" if arn else "NotDerivable")
     except Exception: pass
 
-def c_storagegateway(sess,sink,acct,part,region):
+def c_storagegateway(sess, sink, acct, part, region):
     svc="storagegateway"; cli=sess.client("storagegateway", region_name=region, config=cfg())
     try:
         resp=call_boto(sink, cli, "list_gateways", region=region, service=svc, rtype="gateways", api_args={})
@@ -1177,7 +1189,7 @@ def c_storagegateway(sess,sink,acct,part,region):
             sink.add(region, region, svc, "gateway", arn, name, acct, "list_gateways", "" if arn else "NotDerivable")
     except Exception: pass
 
-def c_wellarchitected(sess,sink,acct,part,region):
+def c_wellarchitected(sess, sink, acct, part, region):
     svc="wellarchitected"; cli=sess.client("wellarchitected", region_name=region, config=cfg())
     try:
         pg=cli.get_paginator("list_workloads")
@@ -1187,7 +1199,7 @@ def c_wellarchitected(sess,sink,acct,part,region):
                 sink.add(region, region, svc, "workload", arn, name, acct, "list_workloads", "" if arn else "NotDerivable")
     except Exception: pass
 
-def c_workspaces(sess,sink,acct,part,region):
+def c_workspaces(sess, sink, acct, part, region):
     svc="workspaces"; cli=sess.client("workspaces", region_name=region, config=cfg())
     try:
         pg=cli.get_paginator("describe_workspaces")
@@ -1198,10 +1210,7 @@ def c_workspaces(sess,sink,acct,part,region):
                 sink.add(region, region, svc, "workspace", arn, wid, acct, "describe_workspaces", "" if arn else "NotDerivable")
     except Exception: pass
 
-# ---------- Extra collectors to complete the union ----------
-def c_opensearch_done(*a, **k): return c_opensearch(*a, **k)
-
-def c_emr(sess,sink,acct,part,region):
+def c_emr(sess, sink, acct, part, region):
     svc="emr"; cli=sess.client("emr", region_name=region, config=cfg())
     try:
         resp=call_boto(sink, cli, "list_clusters", region=region, service=svc, rtype="clusters", api_args={})
@@ -1210,7 +1219,7 @@ def c_emr(sess,sink,acct,part,region):
             sink.add(region, region, svc, "cluster", arn, cid, acct, "list_clusters", "" if arn else "NotDerivable")
     except Exception: pass
 
-def c_emrserverless(sess,sink,acct,part,region):
+def c_emrserverless(sess, sink, acct, part, region):
     svc="emrserverless"; cli=sess.client("emr-serverless", region_name=region, config=cfg())
     try:
         resp=call_boto(sink, cli, "list_applications", region=region, service=svc, rtype="applications", api_args={})
@@ -1219,7 +1228,7 @@ def c_emrserverless(sess,sink,acct,part,region):
             sink.add(region, region, svc, "application", arn, name, acct, "list_applications", "" if arn else "NotDerivable")
     except Exception: pass
 
-def c_elasticbeanstalk(sess,sink,acct,part,region):
+def c_elasticbeanstalk(sess, sink, acct, part, region):
     svc="elasticbeanstalk"; cli=sess.client("elasticbeanstalk", region_name=region, config=cfg())
     try:
         resp=call_boto(sink, cli, "describe_applications", region=region, service=svc, rtype="applications", api_args={})
@@ -1234,10 +1243,9 @@ def c_elasticbeanstalk(sess,sink,acct,part,region):
             sink.add(region, region, svc, "environment", arn, name, acct, "describe_environments", "" if arn else "NotDerivable")
     except Exception: pass
 
-def c_glacier(sess,sink,acct,part,region):
+def c_glacier(sess, sink, acct, part, region):
     svc="glacier"; cli=sess.client("glacier", region_name=region, config=cfg())
     try:
-        # accountId='-' means 'current account' (per API docs)
         pg=cli.get_paginator("list_vaults")
         for page in call_boto(sink, pg, "paginate", region=region, service=svc, rtype="vaults", api_args={"accountId":"-"}):
             for v in page.get("VaultList", []):
@@ -1245,7 +1253,7 @@ def c_glacier(sess,sink,acct,part,region):
                 sink.add(region, region, svc, "vault", arn, name, acct, "list_vaults", "" if arn else "NotDerivable")
     except Exception: pass
 
-def c_memorydb(sess,sink,acct,part,region):
+def c_memorydb(sess, sink, acct, part, region):
     svc="memorydb"; cli=sess.client("memorydb", region_name=region, config=cfg())
     try:
         resp=call_boto(sink, cli, "describe_clusters", region=region, service=svc, rtype="clusters", api_args={})
@@ -1254,7 +1262,7 @@ def c_memorydb(sess,sink,acct,part,region):
             sink.add(region, region, svc, "cluster", arn, name, acct, "describe_clusters", "" if arn else "NotDerivable")
     except Exception: pass
 
-def c_servicecatalog(sess,sink,acct,part,region):
+def c_servicecatalog(sess, sink, acct, part, region):
     svc="servicecatalog"; cli=sess.client("servicecatalog", region_name=region, config=cfg())
     try:
         pg=cli.get_paginator("list_portfolios")
@@ -1264,7 +1272,7 @@ def c_servicecatalog(sess,sink,acct,part,region):
                 sink.add(region, region, svc, "portfolio", arn, name, acct, "list_portfolios", "" if arn else "NotDerivable")
     except Exception: pass
 
-def c_xray(sess,sink,acct,part,region):
+def c_xray(sess, sink, acct, part, region):
     svc="xray"; cli=sess.client("xray", region_name=region, config=cfg())
     try:
         resp=call_boto(sink, cli, "get_groups", region=region, service=svc, rtype="groups", api_args={})
@@ -1280,24 +1288,24 @@ def c_xray(sess,sink,acct,part,region):
     except Exception: pass
 
 # -------- Global-only collectors --------
-def c_cloudfront_global(sess,sink,acct,part):
-    svc="cloudfront"; cli=sess.client("cloudfront", region_name=GLOBAL_SERVICES["cloudfront"], config=cfg())
+def c_cloudfront_global(sess, sink, acct, part):
+    svc="cloudfront"; cli=sess.client("cloudfront", region_name="us-east-1", config=cfg())
     try:
-        resp = call_boto(sink, cli, "list_distributions", region="global", service=svc, rtype="distributions", api_args={})
-        for it in (resp.get("DistributionList",{}).get("Items",[]) or []):
-            arn=it.get("ARN",""); id_=it.get("Id","")
-            sink.add("global", "global", svc, "distribution", arn, id_, acct, "list_distributions", "" if arn else "NotDerivable")
+        pg = cli.get_paginator("list_distributions")
+        for page in call_boto(sink, pg, "paginate", region="global", service=svc, rtype="distributions", api_args={}):
+            for it in (page.get("DistributionList",{}).get("Items",[]) or []):
+                arn=it.get("ARN",""); id_=it.get("Id","")
+                sink.add("global", "global", svc, "distribution", arn, id_, acct, "list_distributions", "" if arn else "NotDerivable")
     except Exception: pass
 
-def c_route53_global(sess,sink,acct,part):
-    svc="route53"; cli=sess.client("route53", region_name=GLOBAL_SERVICES["route53"], config=cfg())
+def c_route53_global(sess, sink, acct, part):
+    svc="route53"; cli=sess.client("route53", region_name="us-east-1", config=cfg())
     try:
         pg=cli.get_paginator("list_hosted_zones")
         for page in call_boto(sink, pg, "paginate", region="global", service=svc, rtype="hosted-zones", api_args={}):
             for z in page.get("HostedZones", []):
                 zid=z.get("Id","").split("/")[-1]; name=z.get("Name","")
                 arn=f"arn:{part}:route53:::hostedzone/{zid}" if zid else ""
-                # count records
                 count=0
                 try:
                     rpg=cli.get_paginator("list_resource_record_sets")
@@ -1308,8 +1316,8 @@ def c_route53_global(sess,sink,acct,part):
                 sink.add("global","global",svc,"hosted-zone",arn,name or zid,acct,"list_hosted_zones+list_resource_record_sets", "" if arn else ("NotDerivable"+(f"; {note}" if note else "")))
     except Exception: pass
 
-def c_iam_global(sess,sink,acct,part):
-    svc="iam"; cli=sess.client("iam", region_name=GLOBAL_SERVICES["iam"], config=cfg())
+def c_iam_global(sess, sink, acct, part):
+    svc="iam"; cli=sess.client("iam", region_name="us-east-1", config=cfg())
     def add(api,key,rtype,arn_field,id_field):
         try:
             pg=cli.get_paginator(api)
@@ -1321,17 +1329,24 @@ def c_iam_global(sess,sink,acct,part):
     add("list_users","Users","user","Arn","UserName")
     add("list_roles","Roles","role","Arn","RoleName")
     add("list_groups","Groups","group","Arn","GroupName")
-    add("list_policies","Policies","policy","Arn","PolicyName")
+    # include ALL policies (Local + AWS Managed)
+    try:
+        pg=cli.get_paginator("list_policies")
+        for page in call_boto(sink, pg, "paginate", region="global", service=svc, rtype="policy", api_args={"Scope": "All"}):
+            for it in page.get("Policies", []):
+                arn=it.get("Arn",""); rid=it.get("PolicyName","")
+                sink.add("global","global",svc,"policy",arn,rid,acct,"list_policies(Scope=All)","" if arn else "NotDerivable")
+    except Exception: pass
 
-def c_organizations_global(sess,sink,acct,part):
-    svc="organizations"; cli=sess.client("organizations", region_name=GLOBAL_SERVICES["organizations"], config=cfg())
+def c_organizations_global(sess, sink, acct, part):
+    svc="organizations"; cli=sess.client("organizations", region_name="us-east-1", config=cfg())
     try:
         o=call_boto(sink, cli, "describe_organization", region="global", service=svc, rtype="organization", api_args={}).get("Organization", {})
         arn=o.get("Arn",""); sink.add("global","global",svc,"organization",arn,o.get("Id",""),acct,"describe_organization","" if arn else "NotDerivable")
     except Exception: pass
 
-def c_budgets_global(sess,sink,acct,part):
-    svc="budgets"; cli=sess.client("budgets", region_name=GLOBAL_SERVICES["budgets"], config=cfg())
+def c_budgets_global(sess, sink, acct, part):
+    svc="budgets"; cli=sess.client("budgets", region_name="us-east-1", config=cfg())
     try:
         pg=cli.get_paginator("describe_budgets")
         for page in call_boto(sink, pg, "paginate", region="global", service=svc, rtype="budgets", api_args={"AccountId": acct}):
@@ -1341,14 +1356,13 @@ def c_budgets_global(sess,sink,acct,part):
                 sink.add("global","global",svc,"budget",arn,name,acct,"describe_budgets","" if arn else "NotDerivable")
     except Exception: pass
 
-# Global services with no listable ARNs: mark NotApplicable
+# Global services with no reliable ARNs to list: mark NotApplicable
 def mark_not_applicable(sink: Sink, service: str):
     sink.write_line(sink.attempted, f"{utc_now()} | region=global | service={service} | resource=n/a | API=n/a | args={{}}")
-    sink.write_line(sink.errors,    f"{utc_now()} | region=global | service={service} | resource=n/a | API=n/a | ERROR=NotApplicable | No listable ARNs.")
+    sink.write_line(sink.errors,    f"{utc_now()} | region=global | service={service} | resource=n/a | API=n/a | ERROR=NotApplicable | No listable ARNs (or classic).")
     sink.add("global","global",service,"n/a","", "", "", "n/a", "NotApplicable")
 
-# 
- placeholder (rare)
+# Regional placeholder (rare)
 def mark_not_implemented(sink: Sink, service: str, region: str):
     sink.write_line(sink.attempted, f"{utc_now()} | region={region} | service={service} | resource=n/a | API=n/a | args={{}}")
     sink.write_line(sink.errors,    f"{utc_now()} | region={region} | service={service} | resource=n/a | API=n/a | ERROR=NotImplemented | Collector not wired.")
@@ -1364,19 +1378,30 @@ REQUESTED = [
  "glue","guardduty","iam","inspector","inspector2","kafka","kinesis","kms","lambda","awslambda","lightsail","logs",
  "macie","memorydb","mq","msk","neptune","networkfirewall","opensearch","organizations","ram","rds","redshift","resourceexplorer2",
  "route53","route53resolver","s3","sagemaker","secretsmanager","securityhub","servicecatalog","ses","shield","sns","sqs","ssm","ssmcontacts","ssmincidents",
- "stepfunctions","storagegateway","sts","transfer","vpc","waf","wafv2","wellarchitected","workspaces","xray","support","trustedadvisor"
+ "stepfunctions","storagegateway","sts","transfer","waf","wafv2","wellarchitected","workspaces","xray","support","trustedadvisor","vpc"
 ]
 
+# Aliases to dedupe overlapping service names
+ALIASES = {
+    "awslambda": "lambda",
+    "documentdb": "docdb",
+    "msk": "kafka",
+    "vpc": "ec2",   # don't schedule separate VPC task; ec2 collector writes VPC resources (service label "vpc")
+}
+
+def canon(svc: str) -> str:
+    return ALIASES.get(svc, svc)
+
 REGIONAL = {
-  "ec2": c_ec2, "vpc": lambda *a, **k: None,
-  "ecr": c_ecr, "ecs": c_ecs, "eks": c_eks, "lambda": c_lambda, "awslambda": c_lambda,
-  "rds": c_rds, "redshift": c_redshift, "dynamodb": c_dynamodb, "docdb": c_docdb, "documentdb": c_docdb, "neptune": c_neptune,
+  "ec2": c_ec2, "ebs": c_ebs,
+  "ecr": c_ecr, "ecs": c_ecs, "eks": c_eks, "lambda": c_lambda,
+  "rds": c_rds, "redshift": c_redshift, "dynamodb": c_dynamodb, "docdb": c_docdb, "neptune": c_neptune,
   "efs": c_efs, "fsx": c_fsx,
   "apigateway": c_apigw, "apigatewayv2": c_apigw2, "eventbridge": c_events, "route53resolver": c_route53resolver,
   "elbv2": c_elbv2, "elb": c_elb, "cloudtrail": c_cloudtrail,
   "kms": c_kms, "secretsmanager": c_secrets, "guardduty": c_guardduty, "securityhub": c_securityhub, "wafv2": c_wafv2,
   "networkfirewall": c_networkfirewall, "accessanalyzer": c_accessanalyzer, "inspector": c_inspector, "inspector2": c_inspector2, "macie": c_macie, "fms": c_fms, "shield": c_shield,
-  "kinesis": c_kinesis, "firehose": c_firehose, "sns": c_sns, "sqs": c_sqs, "kafka": c_kafka, "msk": c_msk,
+  "kinesis": c_kinesis, "firehose": c_firehose, "sns": c_sns, "sqs": c_sqs, "kafka": c_kafka,
   "codeartifact": lambda *a, **k: _codeartifact(*a, **k), "codebuild": lambda *a, **k: _codebuild(*a, **k),
   "codecommit": lambda *a, **k: _codecommit(*a, **k), "codedeploy": lambda *a, **k: _codedeploy(*a, **k), "codepipeline": lambda *a, **k: _codepipeline(*a, **k),
   "cloudwatch": c_cloudwatch, "logs": c_logs,
@@ -1387,18 +1412,18 @@ REGIONAL = {
   "elasticache": c_elasticache, "mq": c_mq, "sagemaker": c_sagemaker, "ses": c_ses,
   "bedrock": c_bedrock, "appstream": c_appstream, "appsync": c_appsync, "acm": c_acm, "detective": c_detective, "dlm": c_dlm, "dms": c_dms, "drs": c_drs,
   "ssm": c_ssm, "ssmcontacts": c_ssmcontacts, "ssmincidents": c_ssmincidents,
-  "glacier": c_glacier, "elasticbeanstalk": c_elasticbeanstalk,
+  "glacier": c_glacier, "elasticbeanstalk": c_elasticbeanstalk, "athena": c_athena, "glue": c_glue, "opensearch": c_opensearch,
 }
 
 GLOBAL_ONLY = {
   "iam": c_iam_global, "cloudfront": c_cloudfront_global, "route53": c_route53_global,
   "organizations": c_organizations_global, "budgets": c_budgets_global,
-  # no ARN-bearing listables:
-  "support": None, "trustedadvisor": None, "sts": None, "account": None, "waf": None  # classic global WAF ACLs seldom expose ARNs; v2 covers ARNs
+  # no useful listable ARNs (classic or non-ARN surfaces):
+  "support": None, "trustedadvisor": None, "sts": None, "account": None, "waf": None
 }
 
 # ---- DevTools late-binding ----
-def _codeartifact(sess,sink,acct,part,region):
+def _codeartifact(sess, sink, acct, part, region):
     svc="codeartifact"; cli=sess.client("codeartifact", region_name=region, config=cfg())
     for api,key,rtype,arnf,idf in [("list_domains","domains","domain","arn","name"),("list_repositories","repositories","repository","arn","name")]:
         try:
@@ -1409,7 +1434,7 @@ def _codeartifact(sess,sink,acct,part,region):
                     sink.add(region, region, svc, rtype, arn, name, acct, api, "" if arn else "NotDerivable")
         except Exception: pass
 
-def _codebuild(sess,sink,acct,part,region):
+def _codebuild(sess, sink, acct, part, region):
     svc="codebuild"; cli=sess.client("codebuild", region_name=region, config=cfg())
     try:
         pg=cli.get_paginator("list_projects"); names=[]
@@ -1422,7 +1447,7 @@ def _codebuild(sess,sink,acct,part,region):
                 sink.add(region, region, svc, "project", arn, name, acct, "batch_get_projects", "" if arn else "NotDerivable")
     except Exception: pass
 
-def _codecommit(sess,sink,acct,part,region):
+def _codecommit(sess, sink, acct, part, region):
     svc="codecommit"; cli=sess.client("codecommit", region_name=region, config=cfg())
     try:
         pg=cli.get_paginator("list_repositories")
@@ -1434,7 +1459,7 @@ def _codecommit(sess,sink,acct,part,region):
                 sink.add(region, region, svc, "repository", arn, name, acct, "get_repository", "" if arn else "NotDerivable")
     except Exception: pass
 
-def _codedeploy(sess,sink,acct,part,region):
+def _codedeploy(sess, sink, acct, part, region):
     svc="codedeploy"; cli=sess.client("codedeploy", region_name=region, config=cfg())
     try:
         resp=call_boto(sink, cli, "list_applications", region=region, service=svc, rtype="applications", api_args={})
@@ -1443,7 +1468,7 @@ def _codedeploy(sess,sink,acct,part,region):
             sink.add(region, region, svc, "application", arn, name, acct, "list_applications", "")
     except Exception: pass
 
-def _codepipeline(sess,sink,acct,part,region):
+def _codepipeline(sess, sink, acct, part, region):
     svc="codepipeline"; cli=sess.client("codepipeline", region_name=region, config=cfg())
     try:
         resp=call_boto(sink, cli, "list_pipelines", region=region, service=svc, rtype="pipelines", api_args={})
@@ -1472,11 +1497,10 @@ def task_run(service: str, region: str, acct: str, part: str, sink: Sink):
         sess = build_session(PROFILE_NAME, region=region)
         fn(sess, sink, acct, part, region)
     except Exception as e:
-        # Top-level failure already logged inside call_boto typically; still add a marker row for visibility
         sink.write_line(sink.errors, f"{utc_now()} | region={region} | service={service} | ERROR=TaskFailed | {type(e).__name__}: {e}")
-        sink.add(region if service not in GLOBAL_ONLY else "global",
-                 region if service not in GLOBAL_ONLY else "global",
-                 service, "n/a", "", "", "", "n/a", "TaskFailed")
+        sheet = "global" if service in GLOBAL_ONLY else region
+        reg = "global" if service in GLOBAL_ONLY else region
+        sink.add(sheet, reg, service, "n/a", "", "", "", "n/a", "TaskFailed")
 
 def main():
     ensure_dir(LOG_DIR)
@@ -1486,15 +1510,19 @@ def main():
     acct, part = discover_account_partition(base)
     regions = discover_regions(base, INCLUDE_OPT_IN_REGIONS)
 
+    # canonicalize requested services
+    requested_canon = sorted(set(canon(s) for s in REQUESTED))
+
     # Build task list
     tasks: List[Tuple[str,str]] = []
-    # global tasks
+    # special-case S3
     tasks.append(("s3","global"))
-    for svc in REQUESTED:
-        if svc in GLOBAL_ONLY and svc != "s3":  # s3 handled above
+    # global tasks
+    for svc in requested_canon:
+        if svc in GLOBAL_ONLY and svc != "s3":
             tasks.append((svc, "global"))
     # regional tasks
-    regional_svcs = [s for s in REQUESTED if s not in GLOBAL_ONLY and s != "s3"]
+    regional_svcs = [s for s in requested_canon if s not in GLOBAL_ONLY and s != "s3"]
     for r in regions:
         for s in regional_svcs:
             tasks.append((s, r))
@@ -1510,7 +1538,7 @@ def main():
     pbar.close()
 
     # Write outputs
-    write_excel(OUTPUT_XLSX, sink.rows)
+    write_excel(OUTPUT_XLSX, sink.rows, regions)
     write_summary(sink.summary, sink)
     print(f"Done.\nExcel: {OUTPUT_XLSX}\nLogs: {LOG_DIR}/attempted_apis.txt, {LOG_DIR}/errors.txt, {LOG_DIR}/summary_counts.txt")
 
