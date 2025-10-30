@@ -1,0 +1,1694 @@
+#!/usr/bin/env python3
+# ASCII only. No hidden characters.
+
+"""
+AWS Full ARN Inventory — Multiprocessing + Region Scope + Created Timestamp
+
+- Hard-coded commercial regions (18) as requested
+- ProcessPoolExecutor for (service, region) tasks; optional per-region threads
+- Least-privilege list/describe calls; paginators used
+- Global service quirks handled (CloudFront, WAFv2(CLOUDFRONT), Shield via us-east-1)
+- S3 buckets discovered globally and placed in their real region
+- Excel: one sheet per region + 'global'
+- Text logs: attempted_apis.txt, errors.txt, summary_counts.txt
+"""
+
+import os
+import sys
+import json
+import time
+import argparse
+import traceback
+from datetime import datetime, timezone
+from typing import Dict, List, Tuple, Optional, Any
+from collections import defaultdict
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+
+# ----- Third-party -----
+try:
+    import boto3, botocore
+    from botocore.config import Config as BotoConfig
+except Exception:
+    print("Install AWS libs: pip install boto3 botocore", file=sys.stderr)
+    raise
+
+try:
+    from openpyxl import Workbook
+    from openpyxl.utils import get_column_letter
+except Exception:
+    print("Install openpyxl: pip install openpyxl", file=sys.stderr)
+    raise
+
+try:
+    from tqdm import tqdm
+except Exception:
+    class tqdm:
+        def __init__(self, iterable=None, total=None, desc=None, dynamic_ncols=True): self.iterable = iterable or []; self.total = total
+        def __iter__(self): return iter(self.iterable)
+        def update(self, *_a, **_k): pass
+        def close(self): pass
+
+# -------------------- Regions (hard-coded) --------------------
+REGIONS = [
+    "us-east-1","us-east-2","us-west-1","us-west-2",
+    "ap-south-1","ap-south-2","ap-southeast-1","ap-southeast-2",
+    "ap-northeast-1","ap-northeast-2","ap-northeast-3",
+    "ca-central-1",
+    "eu-central-1","eu-west-1","eu-west-2","eu-west-3","eu-north-1",
+    "sa-east-1",
+]
+
+# -------------------- Global service homing -------------------
+GLOBAL_HOME = {
+    "iam": "us-east-1",
+    "cloudfront": "us-east-1",
+    "route53": "us-east-1",
+    "organizations": "us-east-1",
+    "budgets": "us-east-1",
+    "waf": "us-east-1",           # classic WAF (no ARNs we list) -> mark NotApplicable
+    "shield": "us-east-1",
+    "support": "us-east-1",       # NotApplicable (no ARNs to enumerate)
+    "trustedadvisor": "us-east-1",# NotApplicable
+    "sts": "us-east-1",           # NotApplicable
+    "account": "us-east-1",       # NotApplicable
+}
+
+# -------------------- Column headers --------------------------
+HEADERS = [
+    "Region", "Service", "ResourceType", "ARN", "ResourceIdOrName",
+    "AccountId", "APIUsed", "Notes", "CreatedAt", "InventoryTimestamp"
+]
+
+# -------------------- Helpers --------------------------
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+def to_iso(val: Any) -> str:
+    """Convert datetime-like to ISO 8601 UTC; return '' if unknown."""
+    if val is None: return ""
+    if isinstance(val, str):
+        # Best effort: if it already looks ISO, return as-is
+        return val
+    if hasattr(val, "astimezone"):
+        try:
+            return val.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        except Exception:
+            pass
+    try:
+        # naive datetime?
+        return datetime.fromtimestamp(val, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    except Exception:
+        return ""
+
+CREATED_KEYS = (
+    "CreationDate","CreationDateTime","CreateDate","CreateTime",
+    "CreatedDate","CreatedTime","CreatedAt","CreationTime",
+    "CreationTimestamp","InstanceCreateTime","LaunchTime",
+    "StartTime","StartDate","StartDateTime","CreatedOn"
+)
+
+def extract_created(obj: Any) -> str:
+    """Search common created-time fields in dicts (AWS shapes differ)."""
+    if not isinstance(obj, dict): return ""
+    for k in CREATED_KEYS:
+        if k in obj:
+            return to_iso(obj.get(k))
+    # Nested spots used by some services
+    if "Table" in obj and isinstance(obj["Table"], dict):  # DynamoDB
+        return extract_created(obj["Table"])
+    if "DBInstanceArn" in obj and "InstanceCreateTime" in obj:  # RDS instance
+        return to_iso(obj.get("InstanceCreateTime"))
+    if "DBClusterArn" in obj and "ClusterCreateTime" in obj:
+        return to_iso(obj.get("ClusterCreateTime"))
+    if "Cluster" in obj and isinstance(obj["Cluster"], dict):   # EKS
+        return extract_created(obj["Cluster"])
+    return ""
+
+def boto_cfg():
+    return BotoConfig(
+        retries={"max_attempts": 10, "mode": "adaptive"},
+        max_pool_connections=256,
+        user_agent_extra="arn-inventory/mp"
+    )
+
+def build_session(profile: str, region: Optional[str] = None):
+    return boto3.Session(profile_name=profile, region_name=region)
+
+def get_acct_partition(sess) -> Tuple[str, str]:
+    sts = sess.client("sts", region_name="us-east-1", config=boto_cfg())
+    idn = sts.get_caller_identity()
+    return idn["Account"], "aws"
+
+# -------------------- Child-task aggregator ------------------
+class LocalAgg:
+    """Collector inside each process. Returns rows + logs to parent."""
+    def __init__(self):
+        self.rows: List[List[str]] = []
+        self.attempted: List[str] = []
+        self.errors: List[str] = []
+
+    def log_attempt(self, region: str, service: str, rtype: str, api: str, args: dict):
+        self.attempted.append(
+            f"{utc_now_iso()} | region={region} | service={service} | resource={rtype} | API={api} | args={json.dumps(args, default=str)}"
+        )
+
+    def log_error(self, region: str, service: str, rtype: str, api: str, code: str, msg: str):
+        self.errors.append(
+            f"{utc_now_iso()} | region={region} | service={service} | resource={rtype} | API={api} | ERROR={code} | {msg}"
+        )
+
+    def add(self, region: str, service: str, rtype: str, arn: str, rid: str,
+            account: str, api: str, notes: str, created_at: str):
+        self.rows.append([
+            region, service, rtype, arn or "", rid or "", account or "",
+            api or "", notes or "", created_at or "", utc_now_iso()
+        ])
+
+def call_boto(agg: LocalAgg, client_or_paginator, fn_name: str, *,
+              region: str, service: str, rtype: str, api_args: dict):
+    agg.log_attempt(region, service, rtype, fn_name, api_args)
+    fn = getattr(client_or_paginator, fn_name)
+    try:
+        return fn(**api_args)
+    except botocore.exceptions.ClientError as ce:
+        code = ce.response.get("Error", {}).get("Code", "ClientError")
+        msg  = ce.response.get("Error", {}).get("Message", str(ce))
+        agg.log_error(region, service, rtype, fn_name, code, msg)
+        raise
+    except Exception as e:
+        agg.log_error(region, service, rtype, fn_name, "Unhandled", f"{type(e).__name__}: {e}")
+        raise
+
+# -------------------- S3 (global => per-bucket region) -------
+def collect_s3(sess, agg: LocalAgg, acct: str, part: str):
+    svc = "s3"
+    cli = sess.client("s3", region_name="us-east-1", config=boto_cfg())
+    try:
+        resp = call_boto(agg, cli, "list_buckets", region="global", service=svc, rtype="buckets", api_args={})
+    except Exception:
+        return
+    for b in resp.get("Buckets", []):
+        name = b.get("Name","")
+        created = extract_created(b) or to_iso(b.get("CreationDate"))
+        # region lookup
+        region = "unknown"
+        try:
+            loc = call_boto(agg, cli, "get_bucket_location", region="global", service=svc, rtype="buckets", api_args={"Bucket": name})
+            lc = loc.get("LocationConstraint")
+            if lc in (None, "EU"):
+                region = "us-east-1" if lc is None else "eu-west-1"
+            else:
+                region = lc
+        except Exception:
+            pass
+        arn = f"arn:{part}:s3:::{name}" if name else ""
+        agg.add(region, "s3", "bucket", arn, name, acct, "list_buckets+get_bucket_location",
+                "" if arn else "NotDerivable", created)
+
+# -------------------- Common collectors (major services) -----
+# NOTE: Focus on list* + minimal describe for ARN/created time.
+
+def c_ec2(sess, agg: LocalAgg, acct, part, region, threads: int):
+    svc = "ec2"; cli = sess.client("ec2", region_name=region, config=boto_cfg())
+    # Instances
+    try:
+        pg = cli.get_paginator("describe_instances")
+        for page in call_boto(agg, pg, "paginate", region=region, service=svc, rtype="instances", api_args={}):
+            for res in page.get("Reservations", []):
+                for it in res.get("Instances", []):
+                    iid = it.get("InstanceId","")
+                    arn = f"arn:{part}:ec2:{region}:{acct}:instance/{iid}" if iid else ""
+                    agg.add(region, "ec2", "instance", arn, iid, acct, "describe_instances", "", extract_created(it))
+    except Exception:
+        pass
+    # VPC family (service label 'vpc')
+    def add_simple(api, key, rtype, id_field, arn_fmt):
+        try:
+            pgx = cli.get_paginator(api)
+            for page in call_boto(agg, pgx, "paginate", region=region, service="vpc", rtype=rtype, api_args={}):
+                for it in page.get(key, []):
+                    rid = it.get(id_field,"")
+                    arn = arn_fmt.format(part=part, reg=region, acct=acct, id=rid) if rid else ""
+                    agg.add(region, "vpc", rtype, arn, rid, acct, api, "", extract_created(it))
+        except Exception:
+            pass
+    add_simple("describe_vpcs","Vpcs","vpc","VpcId","arn:{part}:ec2:{reg}:{acct}:vpc/{id}")
+    add_simple("describe_subnets","Subnets","subnet","SubnetId","arn:{part}:ec2:{reg}:{acct}:subnet/{id}")
+    add_simple("describe_route_tables","RouteTables","route-table","RouteTableId","arn:{part}:ec2:{reg}:{acct}:route-table/{id}")
+    add_simple("describe_internet_gateways","InternetGateways","internet-gateway","InternetGatewayId","arn:{part}:ec2:{reg}:{acct}:internet-gateway/{id}")
+    # NAT GW uses VPC API under ec2
+    try:
+        pgx = cli.get_paginator("describe_nat_gateways")
+        for page in call_boto(agg, pgx, "paginate", region=region, service="vpc", rtype="nat-gateway", api_args={}):
+            for it in page.get("NatGateways", []):
+                rid = it.get("NatGatewayId","")
+                arn = f"arn:{part}:ec2:{region}:{acct}:natgateway/{rid}" if rid else ""
+                agg.add(region, "vpc", "nat-gateway", arn, rid, acct, "describe_nat_gateways", "", extract_created(it))
+    except Exception:
+        pass
+    try:
+        pgx = cli.get_paginator("describe_vpc_endpoints")
+        for page in call_boto(agg, pgx, "paginate", region=region, service="vpc", rtype="vpc-endpoint", api_args={}):
+            for it in page.get("VpcEndpoints", []):
+                rid = it.get("VpcEndpointId","")
+                arn = f"arn:{part}:ec2:{region}:{acct}:vpc-endpoint/{rid}" if rid else ""
+                agg.add(region, "vpc", "vpc-endpoint", arn, rid, acct, "describe_vpc_endpoints", "", extract_created(it))
+    except Exception:
+        pass
+
+def c_ebs(sess, agg, acct, part, region, threads: int):
+    svc = "ebs"; cli = sess.client("ec2", region_name=region, config=boto_cfg())
+    try:
+        pg = cli.get_paginator("describe_volumes")
+        for page in call_boto(agg, pg, "paginate", region=region, service=svc, rtype="volume", api_args={}):
+            for v in page.get("Volumes", []):
+                vid = v.get("VolumeId","")
+                arn = f"arn:{part}:ec2:{region}:{acct}:volume/{vid}" if vid else ""
+                agg.add(region, svc, "volume", arn, vid, acct, "describe_volumes", "", extract_created(v))
+    except Exception:
+        pass
+    try:
+        pg = cli.get_paginator("describe_snapshots")
+        for page in call_boto(agg, pg, "paginate", region=region, service=svc, rtype="snapshot", api_args={"OwnerIds":[acct]}):
+            for s in page.get("Snapshots", []):
+                sid = s.get("SnapshotId","")
+                arn = f"arn:{part}:ec2:{region}:{acct}:snapshot/{sid}" if sid else ""
+                agg.add(region, svc, "snapshot", arn, sid, acct, "describe_snapshots", "", extract_created(s))
+    except Exception:
+        pass
+
+def c_ecr(sess, agg, acct, part, region, threads: int):
+    svc="ecr"; cli=sess.client("ecr", region_name=region, config=boto_cfg())
+    try:
+        pg=cli.get_paginator("describe_repositories")
+        for page in call_boto(agg, pg, "paginate", region=region, service=svc, rtype="repository", api_args={}):
+            for r in page.get("repositories", []):
+                arn=r.get("repositoryArn",""); name=r.get("repositoryName","")
+                agg.add(region, svc, "repository", arn, name, acct, "describe_repositories", "", extract_created(r))
+    except Exception:
+        pass
+
+def c_ecs(sess, agg, acct, part, region, threads: int):
+    svc="ecs"; cli=sess.client("ecs", region_name=region, config=boto_cfg())
+    clusters=[]
+    try:
+        clusters = call_boto(agg, cli, "list_clusters", region=region, service=svc, rtype="cluster", api_args={}).get("clusterArns", [])
+        for arn in clusters:
+            agg.add(region, svc, "cluster", arn, arn.split("/")[-1], acct, "list_clusters", "", "")
+    except Exception:
+        pass
+    # services per cluster (threaded optionally)
+    def list_services(carn: str):
+        try:
+            s_arns = call_boto(agg, cli, "list_services", region=region, service=svc, rtype="service", api_args={"cluster": carn}).get("serviceArns", [])
+            for sarn in s_arns:
+                agg.add(region, svc, "service", sarn, sarn.split("/")[-1], acct, "list_services", "", "")
+        except Exception:
+            pass
+    if clusters:
+        if threads and threads > 1:
+            with ThreadPoolExecutor(max_workers=threads) as ex:
+                list(ex.map(list_services, clusters))
+        else:
+            for c in clusters: list_services(c)
+    # task definitions (global list in region)
+    try:
+        t_arns = call_boto(agg, cli, "list_task_definitions", region=region, service=svc, rtype="task-definition", api_args={}).get("taskDefinitionArns", [])
+        for tarn in t_arns:
+            agg.add(region, svc, "task-definition", tarn, tarn.split("/")[-1], acct, "list_task_definitions", "", "")
+    except Exception:
+        pass
+
+def c_eks(sess, agg, acct, part, region, threads: int):
+    svc="eks"; cli=sess.client("eks", region_name=region, config=boto_cfg())
+    try:
+        names = call_boto(agg, cli, "list_clusters", region=region, service=svc, rtype="cluster", api_args={}).get("clusters", [])
+        for name in names:
+            d = call_boto(agg, cli, "describe_cluster", region=region, service=svc, rtype="cluster", api_args={"name": name})
+            arn = d.get("cluster",{}).get("arn","")
+            created = extract_created(d.get("cluster",{}))
+            agg.add(region, svc, "cluster", arn, name, acct, "describe_cluster", "" if arn else "NotDerivable", created)
+            try:
+                ngs = call_boto(agg, cli, "list_nodegroups", region=region, service=svc, rtype="nodegroup", api_args={"clusterName": name}).get("nodegroups", [])
+                for ng in ngs:
+                    nd = call_boto(agg, cli, "describe_nodegroup", region=region, service=svc, rtype="nodegroup", api_args={"clusterName": name, "nodegroupName": ng})
+                    narn = nd.get("nodegroup",{}).get("nodegroupArn","")
+                    created2 = extract_created(nd.get("nodegroup",{}))
+                    agg.add(region, svc, "nodegroup", narn, ng, acct, "describe_nodegroup", "" if narn else "NotDerivable", created2)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+def c_lambda(sess, agg, acct, part, region, threads: int):
+    svc="lambda"; cli=sess.client("lambda", region_name=region, config=boto_cfg())
+    try:
+        pg=cli.get_paginator("list_functions")
+        for page in call_boto(agg, pg, "paginate", region=region, service=svc, rtype="function", api_args={}):
+            for fn in page.get("Functions", []):
+                arn=fn.get("FunctionArn",""); name=fn.get("FunctionName","")
+                agg.add(region, svc, "function", arn, name, acct, "list_functions", "" if arn else "NotDerivable", extract_created(fn))
+    except Exception:
+        pass
+    try:
+        resp = call_boto(agg, cli, "list_layers", region=region, service=svc, rtype="layer", api_args={})
+        for L in resp.get("Layers", []) or []:
+            lname=L.get("LayerName","")
+            vers = call_boto(agg, cli, "list_layer_versions", region=region, service=svc, rtype="layer-version", api_args={"LayerName": lname})
+            for v in vers.get("LayerVersions", []) or []:
+                larn=v.get("LayerVersionArn","")
+                agg.add(region, svc, "layer-version", larn, lname, acct, "list_layer_versions", "" if larn else "NotDerivable", extract_created(v))
+    except Exception:
+        pass
+
+def c_rds(sess, agg, acct, part, region, threads: int):
+    svc="rds"; cli=sess.client("rds", region_name=region, config=boto_cfg())
+    try:
+        pg=cli.get_paginator("describe_db_instances")
+        for page in call_boto(agg, pg, "paginate", region=region, service=svc, rtype="db-instance", api_args={}):
+            for db in page.get("DBInstances", []):
+                arn=db.get("DBInstanceArn",""); name=db.get("DBInstanceIdentifier","")
+                created = to_iso(db.get("InstanceCreateTime"))
+                agg.add(region, svc, "db-instance", arn, name, acct, "describe_db_instances", "" if arn else "NotDerivable", created)
+    except Exception:
+        pass
+    try:
+        pg=cli.get_paginator("describe_db_clusters")
+        for page in call_boto(agg, pg, "paginate", region=region, service=svc, rtype="db-cluster", api_args={}):
+            for c in page.get("DBClusters", []):
+                arn=c.get("DBClusterArn",""); name=c.get("DBClusterIdentifier","")
+                created = to_iso(c.get("ClusterCreateTime"))
+                agg.add(region, svc, "db-cluster", arn, name, acct, "describe_db_clusters", "" if arn else "NotDerivable", created)
+    except Exception:
+        pass
+
+def c_dynamodb(sess, agg, acct, part, region, threads: int):
+    svc="dynamodb"; cli=sess.client("dynamodb", region_name=region, config=boto_cfg())
+    try:
+        pg=cli.get_paginator("list_tables")
+        for page in call_boto(agg, pg, "paginate", region=region, service=svc, rtype="table", api_args={}):
+            for name in page.get("TableNames", []):
+                d = call_boto(agg, cli, "describe_table", region=region, service=svc, rtype="table", api_args={"TableName": name})
+                arn = d.get("Table",{}).get("TableArn","")
+                created = extract_created(d)
+                agg.add(region, svc, "table", arn, name, acct, "describe_table", "" if arn else "NotDerivable", created)
+    except Exception:
+        pass
+
+def c_docdb(sess, agg, acct, part, region, threads: int):
+    svc="docdb"; cli=sess.client("docdb", region_name=region, config=boto_cfg())
+    try:
+        resp = call_boto(agg, cli, "describe_db_clusters", region=region, service=svc, rtype="db-cluster", api_args={})
+        for c in resp.get("DBClusters", []):
+            arn=c.get("DBClusterArn",""); name=c.get("DBClusterIdentifier","")
+            created = to_iso(c.get("ClusterCreateTime"))
+            agg.add(region, svc, "db-cluster", arn, name, acct, "describe_db_clusters", "" if arn else "NotDerivable", created)
+    except Exception:
+        pass
+
+def c_neptune(sess, agg, acct, part, region, threads: int):
+    svc="neptune"; cli=sess.client("neptune", region_name=region, config=boto_cfg())
+    try:
+        resp = call_boto(agg, cli, "describe_db_clusters", region=region, service=svc, rtype="db-cluster", api_args={})
+        for c in resp.get("DBClusters", []):
+            arn=c.get("DBClusterArn",""); name=c.get("DBClusterIdentifier","")
+            created = to_iso(c.get("ClusterCreateTime"))
+            agg.add(region, svc, "db-cluster", arn, name, acct, "describe_db_clusters", "" if arn else "NotDerivable", created)
+    except Exception:
+        pass
+
+def c_efs(sess, agg, acct, part, region, threads: int):
+    svc="efs"; cli=sess.client("efs", region_name=region, config=boto_cfg())
+    try:
+        pg=cli.get_paginator("describe_file_systems")
+        for page in call_boto(agg, pg, "paginate", region=region, service=svc, rtype="file-system", api_args={}):
+            for fs in page.get("FileSystems", []):
+                arn=fs.get("FileSystemArn",""); fid=fs.get("FileSystemId","")
+                agg.add(region, svc, "file-system", arn, fid, acct, "describe_file_systems", "" if arn else "NotDerivable", extract_created(fs))
+    except Exception:
+        pass
+
+def c_fsx(sess, agg, acct, part, region, threads: int):
+    svc="fsx"; cli=sess.client("fsx", region_name=region, config=boto_cfg())
+    try:
+        pg=cli.get_paginator("describe_file_systems")
+        for page in call_boto(agg, pg, "paginate", region=region, service=svc, rtype="file-system", api_args={}):
+            for fs in page.get("FileSystems", []):
+                arn=fs.get("ResourceARN",""); name=fs.get("FileSystemId","")
+                agg.add(region, svc, "file-system", arn, name, acct, "describe_file_systems", "" if arn else "NotDerivable", extract_created(fs))
+    except Exception:
+        pass
+
+def c_elb(sess, agg, acct, part, region, threads: int):
+    svc="elb"; cli=sess.client("elb", region_name=region, config=boto_cfg())
+    try:
+        pg=cli.get_paginator("describe_load_balancers")
+        for page in call_boto(agg, pg, "paginate", region=region, service=svc, rtype="load-balancer", api_args={}):
+            for lb in page.get("LoadBalancerDescriptions", []):
+                name=lb.get("LoadBalancerName","")
+                arn=f"arn:{part}:elasticloadbalancing:{region}:{acct}:loadbalancer/{name}" if name else ""
+                agg.add(region, svc, "load-balancer", arn, name, acct, "describe_load_balancers", "", extract_created(lb))
+    except Exception:
+        pass
+
+def c_elbv2(sess, agg, acct, part, region, threads: int):
+    svc="elbv2"; cli=sess.client("elbv2", region_name=region, config=boto_cfg())
+    try:
+        pg=cli.get_paginator("describe_load_balancers")
+        for page in call_boto(agg, pg, "paginate", region=region, service=svc, rtype="load-balancer", api_args={}):
+            for lb in page.get("LoadBalancers", []):
+                arn=lb.get("LoadBalancerArn",""); name=lb.get("LoadBalancerName","")
+                agg.add(region, svc, "load-balancer", arn, name, acct, "describe_load_balancers", "" if arn else "NotDerivable", extract_created(lb))
+    except Exception:
+        pass
+
+def c_apigw(sess, agg, acct, part, region, threads: int):
+    svc="apigateway"; cli=sess.client("apigateway", region_name=region, config=boto_cfg())
+    try:
+        pg=cli.get_paginator("get_rest_apis")
+        for page in call_boto(agg, pg, "paginate", region=region, service=svc, rtype="rest-api", api_args={}):
+            for it in page.get("items", []):
+                api_id=it.get("id","")
+                arn=f"arn:{part}:apigateway:{region}::/restapis/{api_id}" if api_id else ""
+                agg.add(region, svc, "rest-api", arn, it.get("name", api_id), acct, "get_rest_apis", "", extract_created(it))
+    except Exception:
+        pass
+
+def c_apigw2(sess, agg, acct, part, region, threads: int):
+    svc="apigatewayv2"; cli=sess.client("apigatewayv2", region_name=region, config=boto_cfg())
+    try:
+        pg=cli.get_paginator("get_apis")
+        for page in call_boto(agg, pg, "paginate", region=region, service=svc, rtype="api", api_args={}):
+            for it in page.get("Items", []):
+                api_id=it.get("ApiId","")
+                arn=f"arn:{part}:apigateway:{region}::/apis/{api_id}" if api_id else ""
+                agg.add(region, svc, "api", arn, it.get("Name", api_id), acct, "get_apis", "", extract_created(it))
+    except Exception:
+        pass
+
+def c_glue(sess, agg, acct, part, region, threads: int):
+    svc="glue"; cli=sess.client("glue", region_name=region, config=boto_cfg())
+    try:
+        pg=cli.get_paginator("get_crawlers")
+        for page in call_boto(agg, pg, "paginate", region=region, service=svc, rtype="crawler", api_args={}):
+            for c in page.get("Crawlers", []):
+                arn=c.get("CrawlerArn",""); name=c.get("Name","")
+                agg.add(region, svc, "crawler", arn, name, acct, "get_crawlers", "" if arn else "NotDerivable", extract_created(c))
+    except Exception:
+        pass
+    try:
+        pg=cli.get_paginator("get_jobs")
+        for page in call_boto(agg, pg, "paginate", region=region, service=svc, rtype="job", api_args={}):
+            for j in page.get("Jobs", []):
+                arn=j.get("Arn",""); name=j.get("Name","")
+                agg.add(region, svc, "job", arn, name, acct, "get_jobs", "" if arn else "NotDerivable", extract_created(j))
+    except Exception:
+        pass
+    try:
+        pg=cli.get_paginator("get_databases")
+        for page in call_boto(agg, pg, "paginate", region=region, service=svc, rtype="database", api_args={}):
+            for d in page.get("DatabaseList", []):
+                name=d.get("Name","")
+                arn = f"arn:{part}:glue:{region}:{acct}:database/{name}" if name else ""
+                agg.add(region, svc, "database", arn, name, acct, "get_databases", "" if arn else "NotDerivable", extract_created(d))
+    except Exception:
+        pass
+
+def c_athena(sess, agg, acct, part, region, threads: int):
+    svc="athena"; cli=sess.client("athena", region_name=region, config=boto_cfg())
+    try:
+        resp=call_boto(agg, cli, "list_work_groups", region=region, service=svc, rtype="workgroup", api_args={})
+        for wg in resp.get("WorkGroups", []):
+            name=wg.get("Name","")
+            arn=f"arn:{part}:athena:{region}:{acct}:workgroup/{name}" if name else ""
+            agg.add(region, svc, "workgroup", arn, name, acct, "list_work_groups", "" if arn else "NotDerivable", extract_created(wg))
+    except Exception:
+        pass
+
+def c_cloudtrail(sess, agg, acct, part, region, threads: int):
+    svc="cloudtrail"; cli=sess.client("cloudtrail", region_name=region, config=boto_cfg())
+    try:
+        resp = call_boto(agg, cli, "list_trails", region=region, service=svc, rtype="trail", api_args={})
+        for t in resp.get("Trails", []):
+            arn=t.get("TrailARN",""); name=t.get("Name","")
+            agg.add(region, svc, "trail", arn, name, acct, "list_trails", "" if arn else "NotDerivable", extract_created(t))
+    except Exception:
+        pass
+
+def c_cfn(sess, agg, acct, part, region, threads: int):
+    svc="cloudformation"; cli=sess.client("cloudformation", region_name=region, config=boto_cfg())
+    try:
+        pg=cli.get_paginator("list_stacks")
+        statuses=["CREATE_COMPLETE","UPDATE_COMPLETE","UPDATE_ROLLBACK_COMPLETE","IMPORT_COMPLETE","ROLLBACK_COMPLETE"]
+        for page in call_boto(agg, pg, "paginate", region=region, service=svc, rtype="stack", api_args={"StackStatusFilter": statuses}):
+            for s in page.get("StackSummaries", []):
+                sid=s.get("StackId",""); name=s.get("StackName","")
+                arn=sid if sid.startswith("arn:") else ""
+                agg.add(region, svc, "stack", arn, name, acct, "list_stacks", "" if arn else "NotDerivable", extract_created(s))
+    except Exception:
+        pass
+
+def c_cloudwatch(sess, agg, acct, part, region, threads: int):
+    svc="cloudwatch"; cli=sess.client("cloudwatch", region_name=region, config=boto_cfg())
+    try:
+        pg=cli.get_paginator("describe_alarms")
+        for page in call_boto(agg, pg, "paginate", region=region, service=svc, rtype="alarm", api_args={}):
+            for a in page.get("MetricAlarms", []):
+                arn=a.get("AlarmArn",""); name=a.get("AlarmName","")
+                agg.add(region, svc, "alarm", arn, name, acct, "describe_alarms", "" if arn else "NotDerivable", extract_created(a))
+            for a in page.get("CompositeAlarms", []):
+                arn=a.get("AlarmArn",""); name=a.get("AlarmName","")
+                agg.add(region, svc, "composite-alarm", arn, name, acct, "describe_alarms", "" if arn else "NotDerivable", extract_created(a))
+    except Exception:
+        pass
+
+def c_logs(sess, agg, acct, part, region, threads: int):
+    svc="logs"; cli=sess.client("logs", region_name=region, config=boto_cfg())
+    try:
+        pg=cli.get_paginator("describe_log_groups")
+        for page in call_boto(agg, pg, "paginate", region=region, service=svc, rtype="log-group", api_args={}):
+            for g in page.get("logGroups", []):
+                arn=g.get("arn",""); name=g.get("logGroupName","")
+                agg.add(region, svc, "log-group", arn, name, acct, "describe_log_groups", "" if arn else "NotDerivable", extract_created(g))
+    except Exception:
+        pass
+
+def c_kms(sess, agg, acct, part, region, threads: int):
+    svc="kms"; cli=sess.client("kms", region_name=region, config=boto_cfg())
+    # keys
+    try:
+        pg=cli.get_paginator("list_keys")
+        keys=[]
+        for page in call_boto(agg, pg, "paginate", region=region, service=svc, rtype="key", api_args={}):
+            keys += page.get("Keys", [])
+        # describe in threads (optional)
+        def desc(k):
+            kid = k.get("KeyId")
+            try:
+                d=call_boto(agg, cli, "describe_key", region=region, service=svc, rtype="key", api_args={"KeyId": kid})
+                md=d.get("KeyMetadata",{}); arn=md.get("Arn","")
+                agg.add(region, svc, "key", arn, kid, acct, "describe_key", "" if arn else "NotDerivable", extract_created(md))
+            except Exception:
+                pass
+        if keys:
+            if threads and threads > 1:
+                with ThreadPoolExecutor(max_workers=threads) as ex:
+                    list(ex.map(desc, keys))
+            else:
+                for k in keys: desc(k)
+    except Exception:
+        pass
+    # aliases
+    try:
+        pg=cli.get_paginator("list_aliases")
+        for page in call_boto(agg, pg, "paginate", region=region, service=svc, rtype="alias", api_args={}):
+            for a in page.get("Aliases", []):
+                arn=a.get("AliasArn",""); name=a.get("AliasName","")
+                agg.add(region, svc, "alias", arn, name, acct, "list_aliases", "" if arn else "NotDerivable", extract_created(a))
+    except Exception:
+        pass
+
+def c_secrets(sess, agg, acct, part, region, threads: int):
+    svc="secretsmanager"; cli=sess.client("secretsmanager", region_name=region, config=boto_cfg())
+    try:
+        pg=cli.get_paginator("list_secrets")
+        for page in call_boto(agg, pg, "paginate", region=region, service=svc, rtype="secret", api_args={}):
+            for s in page.get("SecretList", []):
+                arn=s.get("ARN",""); name=s.get("Name","")
+                agg.add(region, svc, "secret", arn, name, acct, "list_secrets", "" if arn else "NotDerivable", extract_created(s))
+    except Exception:
+        pass
+
+def c_sns(sess, agg, acct, part, region, threads: int):
+    svc="sns"; cli=sess.client("sns", region_name=region, config=boto_cfg())
+    try:
+        pg=cli.get_paginator("list_topics")
+        for page in call_boto(agg, pg, "paginate", region=region, service=svc, rtype="topic", api_args={}):
+            for t in page.get("Topics", []):
+                arn=t.get("TopicArn","")
+                agg.add(region, svc, "topic", arn, arn.split(":")[-1], acct, "list_topics", "" if arn else "NotDerivable", "")
+    except Exception:
+        pass
+
+def c_sqs(sess, agg, acct, part, region, threads: int):
+    svc="sqs"; cli=sess.client("sqs", region_name=region, config=boto_cfg())
+    try:
+        resp = call_boto(agg, cli, "list_queues", region=region, service=svc, rtype="queue", api_args={})
+        for url in resp.get("QueueUrls", []) or []:
+            attrs = call_boto(agg, cli, "get_queue_attributes", region=region, service=svc, rtype="queue", api_args={"QueueUrl": url, "AttributeNames":["QueueArn","CreatedTimestamp"]})
+            arn = (attrs.get("Attributes",{}) or {}).get("QueueArn","")
+            created = ""
+            try:
+                ts = attrs.get("Attributes",{}).get("CreatedTimestamp")
+                if ts is not None:
+                    created = to_iso(int(ts))
+            except Exception:
+                pass
+            agg.add(region, svc, "queue", arn, url.rsplit("/",1)[-1], acct, "list_queues+get_queue_attributes", "" if arn else "NotDerivable", created)
+    except Exception:
+        pass
+
+def c_transfer(sess, agg, acct, part, region, threads: int):
+    svc="transfer"; cli=sess.client("transfer", region_name=region, config=boto_cfg())
+    try:
+        pg=cli.get_paginator("list_servers")
+        for page in call_boto(agg, pg, "paginate", region=region, service=svc, rtype="server", api_args={}):
+            for s in page.get("Servers", []):
+                arn=s.get("Arn",""); sid=s.get("ServerId","")
+                agg.add(region, svc, "server", arn, sid, acct, "list_servers", "" if arn else "NotDerivable", extract_created(s))
+    except Exception:
+        pass
+
+def c_guardduty(sess, agg, acct, part, region, threads: int):
+    svc="guardduty"; cli=sess.client("guardduty", region_name=region, config=boto_cfg())
+    try:
+        dets = call_boto(agg, cli, "list_detectors", region=region, service=svc, rtype="detector", api_args={}).get("DetectorIds", [])
+        for d in dets:
+            arn=f"arn:{part}:guardduty:{region}:{acct}:detector/{d}"
+            agg.add(region, svc, "detector", arn, d, acct, "list_detectors", "", "")
+    except Exception:
+        pass
+
+def c_securityhub(sess, agg, acct, part, region, threads: int):
+    svc="securityhub"; cli=sess.client("securityhub", region_name=region, config=boto_cfg())
+    try:
+        h = call_boto(agg, cli, "describe_hub", region=region, service=svc, rtype="hub", api_args={})
+        arn=h.get("HubArn","")
+        if arn:
+            agg.add(region, svc, "hub", arn, arn.split(":")[-1], acct, "describe_hub", "", extract_created(h))
+    except botocore.exceptions.ClientError:
+        pass
+    except Exception:
+        pass
+
+def c_events(sess, agg, acct, part, region, threads: int):
+    svc="eventbridge"; cli=sess.client("events", region_name=region, config=boto_cfg())
+    try:
+        resp = call_boto(agg, cli, "list_event_buses", region=region, service=svc, rtype="event-bus", api_args={})
+        for b in resp.get("EventBuses", []):
+            arn=b.get("Arn",""); name=b.get("Name","")
+            agg.add(region, svc, "event-bus", arn, name, acct, "list_event_buses", "" if arn else "NotDerivable", extract_created(b))
+    except Exception:
+        pass
+    try:
+        pg=cli.get_paginator("list_rules")
+        for page in call_boto(agg, pg, "paginate", region=region, service=svc, rtype="rule", api_args={}):
+            for r in page.get("Rules", []):
+                arn=r.get("Arn",""); name=r.get("Name","")
+                agg.add(region, svc, "rule", arn, name, acct, "list_rules", "" if arn else "NotDerivable", extract_created(r))
+    except Exception:
+        pass
+
+def c_wafv2(sess, agg, acct, part, region, threads: int):
+    svc="wafv2"; cli=sess.client("wafv2", region_name=region, config=boto_cfg())
+    # Regional scope
+    try:
+        pg=cli.get_paginator("list_web_acls")
+        for page in call_boto(agg, pg, "paginate", region=region, service=svc, rtype="web-acl", api_args={"Scope": "REGIONAL"}):
+            for it in page.get("WebACLs", []):
+                arn=it.get("ARN",""); name=it.get("Name","")
+                agg.add(region, svc, "web-acl", arn, name, acct, "list_web_acls(REGIONAL)", "" if arn else "NotDerivable", extract_created(it))
+    except Exception:
+        pass
+    # CloudFront scope (global via us-east-1)
+    try:
+        cli_cf = sess.client("wafv2", region_name="us-east-1", config=boto_cfg())
+        pg = cli_cf.get_paginator("list_web_acls")
+        for page in call_boto(agg, pg, "paginate", region="global", service=svc, rtype="web-acl", api_args={"Scope": "CLOUDFRONT"}):
+            for it in page.get("WebACLs", []):
+                arn=it.get("ARN",""); name=it.get("Name","")
+                agg.add("global", svc, "web-acl", arn, name, acct, "list_web_acls(CLOUDFRONT)", "" if arn else "NotDerivable", extract_created(it))
+    except Exception:
+        pass
+
+def c_networkfirewall(sess, agg, acct, part, region, threads: int):
+    svc="networkfirewall"; cli=sess.client("networkfirewall", region_name=region, config=boto_cfg())
+    try:
+        pg=cli.get_paginator("list_firewalls")
+        for page in call_boto(agg, pg, "paginate", region=region, service=svc, rtype="firewall", api_args={}):
+            for f in page.get("Firewalls", []):
+                arn=f.get("FirewallArn",""); name=f.get("FirewallName","")
+                agg.add(region, svc, "firewall", arn, name, acct, "list_firewalls", "" if arn else "NotDerivable", extract_created(f))
+    except Exception:
+        pass
+
+def c_accessanalyzer(sess, agg, acct, part, region, threads: int):
+    svc="accessanalyzer"; cli=sess.client("accessanalyzer", region_name=region, config=boto_cfg())
+    try:
+        resp=call_boto(agg, cli, "list_analyzers", region=region, service=svc, rtype="analyzer", api_args={})
+        for a in resp.get("analyzers", []):
+            arn=a.get("arn",""); name=a.get("name","")
+            agg.add(region, svc, "analyzer", arn, name, acct, "list_analyzers", "" if arn else "NotDerivable", extract_created(a))
+    except Exception:
+        pass
+
+def c_inspector(sess, agg, acct, part, region, threads: int):
+    svc="inspector"; cli=sess.client("inspector", region_name=region, config=boto_cfg())
+    try:
+        resp = call_boto(agg, cli, "list_assessment_templates", region=region, service=svc, rtype="assessment-template", api_args={})
+        for a in resp.get("assessmentTemplateArns", []):
+            agg.add(region, svc, "assessment-template", a, a.split("/")[-1], acct, "list_assessment_templates", "", "")
+    except Exception:
+        pass
+
+def c_inspector2(sess, agg, acct, part, region, threads: int):
+    svc="inspector2"; cli=sess.client("inspector2", region_name=region, config=boto_cfg())
+    try:
+        resp=call_boto(agg, cli, "list_filters", region=region, service=svc, rtype="filter", api_args={})
+        for f in resp.get("filters", []):
+            arn=f.get("arn",""); name=f.get("name","")
+            agg.add(region, svc, "filter", arn, name, acct, "list_filters", "" if arn else "NotDerivable", extract_created(f))
+    except Exception:
+        pass
+
+def c_kafka(sess, agg, acct, part, region, threads: int):
+    svc="kafka"; cli=sess.client("kafka", region_name=region, config=boto_cfg())
+    try:
+        resp=call_boto(agg, cli, "list_clusters_v2", region=region, service=svc, rtype="cluster", api_args={})
+        for c in resp.get("ClusterInfoList", []):
+            arn=c.get("ClusterArn",""); name=c.get("ClusterName","")
+            agg.add(region, svc, "cluster", arn, name, acct, "list_clusters_v2", "" if arn else "NotDerivable", extract_created(c))
+    except Exception:
+        pass
+
+def c_kinesis(sess, agg, acct, part, region, threads: int):
+    svc="kinesis"; cli=sess.client("kinesis", region_name=region, config=boto_cfg())
+    try:
+        pg=cli.get_paginator("list_streams")
+        for page in call_boto(agg, pg, "paginate", region=region, service=svc, rtype="stream", api_args={}):
+            for name in page.get("StreamNames", []):
+                d=call_boto(agg, cli, "describe_stream_summary", region=region, service=svc, rtype="stream", api_args={"StreamName": name})
+                arn=d.get("StreamDescriptionSummary",{}).get("StreamARN","")
+                created = extract_created(d.get("StreamDescriptionSummary",{}))
+                agg.add(region, svc, "stream", arn, name, acct, "describe_stream_summary", "" if arn else "NotDerivable", created)
+    except Exception:
+        pass
+
+def c_firehose(sess, agg, acct, part, region, threads: int):
+    svc="firehose"; cli=sess.client("firehose", region_name=region, config=boto_cfg())
+    try:
+        pg=cli.get_paginator("list_delivery_streams")
+        for page in call_boto(agg, pg, "paginate", region=region, service=svc, rtype="delivery-stream", api_args={}):
+            for name in page.get("DeliveryStreamNames", []):
+                d = call_boto(agg, cli, "describe_delivery_stream", region=region, service=svc, rtype="delivery-stream", api_args={"DeliveryStreamName": name})
+                arn = d.get("DeliveryStreamDescription",{}).get("DeliveryStreamARN","")
+                created = extract_created(d.get("DeliveryStreamDescription",{}))
+                agg.add(region, svc, "delivery-stream", arn, name, acct, "describe_delivery_stream", "" if arn else "NotDerivable", created)
+    except Exception:
+        pass
+
+def c_acm(sess, agg, acct, part, region, threads: int):
+    svc="acm"; cli=sess.client("acm", region_name=region, config=boto_cfg())
+    try:
+        pg=cli.get_paginator("list_certificates")
+        for page in call_boto(agg, pg, "paginate", region=region, service=svc, rtype="certificate", api_args={}):
+            for c in page.get("CertificateSummaryList", []):
+                arn=c.get("CertificateArn",""); name=c.get("DomainName","") or arn.split("/")[-1]
+                agg.add(region, svc, "certificate", arn, name, acct, "list_certificates", "" if arn else "NotDerivable", extract_created(c))
+    except Exception:
+        pass
+
+def c_appconfig(sess, agg, acct, part, region, threads: int):
+    svc="appconfig"; cli=sess.client("appconfig", region_name=region, config=boto_cfg())
+    try:
+        pg=cli.get_paginator("list_applications")
+        apps=[]
+        for page in call_boto(agg, pg, "paginate", region=region, service=svc, rtype="application", api_args={}):
+            for a in page.get("Items", []):
+                aid=a.get("Id",""); name=a.get("Name","")
+                arn=f"arn:{part}:appconfig:{region}:{acct}:application/{aid}" if aid else ""
+                agg.add(region, svc, "application", arn, name or aid, acct, "list_applications", "" if arn else "NotDerivable", extract_created(a))
+                apps.append(aid)
+        def envs(aid: str):
+            try:
+                epg=cli.get_paginator("list_environments")
+                for page in call_boto(agg, epg, "paginate", region=region, service=svc, rtype="environment", api_args={"ApplicationId": aid}):
+                    for e in page.get("Items", []):
+                        eid=e.get("Id",""); en=e.get("Name","")
+                        e_arn = f"arn:{part}:appconfig:{region}:{acct}:application/{aid}/environment/{eid}" if aid and eid else ""
+                        agg.add(region, svc, "environment", e_arn, en or eid, acct, "list_environments", "" if e_arn else "NotDerivable", extract_created(e))
+            except Exception:
+                pass
+        if apps:
+            if threads and threads > 1:
+                with ThreadPoolExecutor(max_workers=threads) as ex:
+                    list(ex.map(envs, apps))
+            else:
+                for a in apps: envs(a)
+    except Exception:
+        pass
+
+def c_appstream(sess, agg, acct, part, region, threads: int):
+    svc="appstream"; cli=sess.client("appstream", region_name=region, config=boto_cfg())
+    try:
+        pg=cli.get_paginator("describe_stacks")
+        for page in call_boto(agg, pg, "paginate", region=region, service=svc, rtype="stack", api_args={}):
+            for st in page.get("Stacks", []):
+                arn=st.get("Arn",""); name=st.get("Name","")
+                agg.add(region, svc, "stack", arn, name, acct, "describe_stacks", "" if arn else "NotDerivable", extract_created(st))
+    except Exception:
+        pass
+    try:
+        pg=cli.get_paginator("describe_fleets")
+        for page in call_boto(agg, pg, "paginate", region=region, service=svc, rtype="fleet", api_args={}):
+            for fl in page.get("Fleets", []):
+                arn=fl.get("Arn",""); name=fl.get("Name","")
+                agg.add(region, svc, "fleet", arn, name, acct, "describe_fleets", "" if arn else "NotDerivable", extract_created(fl))
+    except Exception:
+        pass
+
+def c_appsync(sess, agg, acct, part, region, threads: int):
+    svc="appsync"; cli=sess.client("appsync", region_name=region, config=boto_cfg())
+    try:
+        pg=cli.get_paginator("list_graphql_apis")
+        for page in call_boto(agg, pg, "paginate", region=region, service=svc, rtype="graphql-api", api_args={}):
+            for g in page.get("graphqlApis", []):
+                arn=g.get("arn",""); name=g.get("name","")
+                agg.add(region, svc, "graphql-api", arn, name, acct, "list_graphql_apis", "" if arn else "NotDerivable", extract_created(g))
+    except Exception:
+        pass
+
+def c_auditmanager(sess, agg, acct, part, region, threads: int):
+    svc="auditmanager"; cli=sess.client("auditmanager", region_name=region, config=boto_cfg())
+    try:
+        pg=cli.get_paginator("list_assessments")
+        for page in call_boto(agg, pg, "paginate", region=region, service=svc, rtype="assessment", api_args={}):
+            for a in page.get("assessmentMetadata", []):
+                arn=a.get("arn",""); name=a.get("name","")
+                agg.add(region, svc, "assessment", arn, name, acct, "list_assessments", "" if arn else "NotDerivable", extract_created(a))
+    except Exception:
+        pass
+
+def c_autoscaling(sess, agg, acct, part, region, threads: int):
+    svc="autoscaling"; cli=sess.client("autoscaling", region_name=region, config=boto_cfg())
+    try:
+        pg=cli.get_paginator("describe_auto_scaling_groups")
+        for page in call_boto(agg, pg, "paginate", region=region, service=svc, rtype="auto-scaling-group", api_args={}):
+            for g in page.get("AutoScalingGroups", []):
+                arn=g.get("AutoScalingGroupARN",""); name=g.get("AutoScalingGroupName","")
+                agg.add(region, svc, "auto-scaling-group", arn, name, acct, "describe_auto_scaling_groups", "" if arn else "NotDerivable", extract_created(g))
+    except Exception:
+        pass
+
+def c_backup(sess, agg, acct, part, region, threads: int):
+    svc="backup"; cli=sess.client("backup", region_name=region, config=boto_cfg())
+    try:
+        pg=cli.get_paginator("list_backup_vaults")
+        for page in call_boto(agg, pg, "paginate", region=region, service=svc, rtype="backup-vault", api_args={}):
+            for v in page.get("BackupVaultList", []):
+                arn=v.get("BackupVaultArn",""); name=v.get("BackupVaultName","")
+                agg.add(region, svc, "backup-vault", arn, name, acct, "list_backup_vaults", "" if arn else "NotDerivable", extract_created(v))
+    except Exception:
+        pass
+
+def c_batch(sess, agg, acct, part, region, threads: int):
+    svc="batch"; cli=sess.client("batch", region_name=region, config=boto_cfg())
+    try:
+        resp=call_boto(agg, cli, "describe_job_queues", region=region, service=svc, rtype="job-queue", api_args={})
+        for q in resp.get("jobQueues", []):
+            arn=q.get("jobQueueArn",""); name=q.get("jobQueueName","")
+            agg.add(region, svc, "job-queue", arn, name, acct, "describe_job_queues", "" if arn else "NotDerivable", extract_created(q))
+    except Exception:
+        pass
+    try:
+        resp=call_boto(agg, cli, "describe_compute_environments", region=region, service=svc, rtype="compute-environment", api_args={})
+        for ce in resp.get("computeEnvironments", []):
+            arn=ce.get("computeEnvironmentArn",""); name=ce.get("computeEnvironmentName","")
+            agg.add(region, svc, "compute-environment", arn, name, acct, "describe_compute_environments", "" if arn else "NotDerivable", extract_created(ce))
+    except Exception:
+        pass
+    try:
+        resp=call_boto(agg, cli, "describe_job_definitions", region=region, service=svc, rtype="job-definition", api_args={})
+        for jd in resp.get("jobDefinitions", []):
+            arn=jd.get("jobDefinitionArn",""); name=jd.get("jobDefinitionName","")
+            agg.add(region, svc, "job-definition", arn, name, acct, "describe_job_definitions", "" if arn else "NotDerivable", extract_created(jd))
+    except Exception:
+        pass
+
+def c_bedrock(sess, agg, acct, part, region, threads: int):
+    svc="bedrock"
+    try:
+        cli=sess.client("bedrock-agent", region_name=region, config=boto_cfg())
+        resp=call_boto(agg, cli, "list_agents", region=region, service=svc, rtype="agent", api_args={})
+        for ag in resp.get("agentSummaries", []):
+            arn=ag.get("agentArn",""); name=ag.get("agentName","")
+            agg.add(region, svc, "agent", arn, name, acct, "list_agents", "" if arn else "NotDerivable", extract_created(ag))
+        kb = call_boto(agg, cli, "list_knowledge_bases", region=region, service=svc, rtype="knowledge-base", api_args={})
+        for k in kb.get("knowledgeBaseSummaries", []):
+            arn=k.get("knowledgeBaseArn",""); name=k.get("name","")
+            agg.add(region, svc, "knowledge-base", arn, name, acct, "list_knowledge_bases", "" if arn else "NotDerivable", extract_created(k))
+    except Exception:
+        pass
+
+def c_cognito(sess, agg, acct, part, region, threads: int):
+    # user pools
+    try:
+        cli=sess.client("cognito-idp", region_name=region, config=boto_cfg())
+        resp=call_boto(agg, cli, "list_user_pools", region=region, service="cognito", rtype="user-pool", api_args={"MaxResults":60})
+        for up in resp.get("UserPools", []):
+            pid=up.get("Id",""); name=up.get("Name","")
+            d = call_boto(agg, cli, "describe_user_pool", region=region, service="cognito", rtype="user-pool", api_args={"UserPoolId": pid})
+            arn=d.get("UserPool",{}).get("Arn","")
+            agg.add(region, "cognito", "user-pool", arn, name or pid, acct, "describe_user_pool", "" if arn else "NotDerivable", extract_created(d.get("UserPool",{})))
+    except Exception:
+        pass
+    # identity pools
+    try:
+        cli=sess.client("cognito-identity", region_name=region, config=boto_cfg())
+        resp=call_boto(agg, cli, "list_identity_pools", region=region, service="cognito", rtype="identity-pool", api_args={"MaxResults":60})
+        for ip in resp.get("IdentityPools", []):
+            pid=ip.get("IdentityPoolId",""); name=ip.get("IdentityPoolName","")
+            arn=f"arn:{part}:cognito-identity:{region}:{acct}:identitypool/{pid}" if pid else ""
+            agg.add(region, "cognito", "identity-pool", arn, name or pid, acct, "list_identity_pools", "" if arn else "NotDerivable", extract_created(ip))
+    except Exception:
+        pass
+
+def c_config(sess, agg, acct, part, region, threads: int):
+    svc="config"; cli=sess.client("config", region_name=region, config=boto_cfg())
+    try:
+        pg=cli.get_paginator("describe_config_rules")
+        for page in call_boto(agg, pg, "paginate", region=region, service=svc, rtype="config-rule", api_args={}):
+            for r in page.get("ConfigRules", []):
+                arn=r.get("ConfigRuleArn",""); name=r.get("ConfigRuleName","")
+                agg.add(region, svc, "config-rule", arn, name, acct, "describe_config_rules", "" if arn else "NotDerivable", extract_created(r))
+    except Exception:
+        pass
+
+def c_detective(sess, agg, acct, part, region, threads: int):
+    svc="detective"; cli=sess.client("detective", region_name=region, config=boto_cfg())
+    try:
+        resp=call_boto(agg, cli, "list_graphs", region=region, service=svc, rtype="graph", api_args={})
+        for g in resp.get("GraphList", []):
+            arn=g.get("Arn") or g.get("GraphArn",""); name=(g.get("Arn") or "").split("/")[-1]
+            agg.add(region, svc, "graph", arn, name, acct, "list_graphs", "" if arn else "NotDerivable", extract_created(g))
+    except Exception:
+        pass
+
+def c_directconnect(sess, agg, acct, part, region, threads: int):
+    svc="directconnect"; cli=sess.client("directconnect", region_name=region, config=boto_cfg())
+    try:
+        resp=call_boto(agg, cli, "describe_connections", region=region, service=svc, rtype="connection", api_args={})
+        for c in resp.get("connections", []):
+            cid=c.get("connectionId","")
+            arn=""  # API doesn't return an ARN here
+            agg.add(region, svc, "connection", arn, cid, acct, "describe_connections", "NotDerivable", extract_created(c))
+    except Exception:
+        pass
+
+def c_directoryservice(sess, agg, acct, part, region, threads: int):
+    svc="directoryservice"; cli=sess.client("ds", region_name=region, config=boto_cfg())
+    try:
+        resp=call_boto(agg, cli, "describe_directories", region=region, service=svc, rtype="directory", api_args={})
+        for d in resp.get("DirectoryDescriptions", []):
+            did=d.get("DirectoryId",""); name=d.get("Name","")
+            arn=f"arn:{part}:ds:{region}:{acct}:directory/{did}" if did else ""
+            agg.add(region, svc, "directory", arn, name or did, acct, "describe_directories", "" if arn else "NotDerivable", extract_created(d))
+    except Exception:
+        pass
+
+def c_datasync(sess, agg, acct, part, region, threads: int):
+    svc="datasync"; cli=sess.client("datasync", region_name=region, config=boto_cfg())
+    for spec in [("list_agents","Agents","agent","Arn","Name"),
+                 ("list_locations","Locations","location","LocationArn","LocationUri"),
+                 ("list_tasks","Tasks","task","TaskArn","Name")]:
+        try:
+            api,key,rtype,arn_f,id_f = spec
+            pg=cli.get_paginator(api)
+            for page in call_boto(agg, pg, "paginate", region=region, service=svc, rtype=rtype, api_args={}):
+                for it in page.get(key, []):
+                    arn=it.get(arn_f,""); rid=it.get(id_f,"")
+                    agg.add(region, svc, rtype, arn, rid, acct, api, "" if arn else "NotDerivable", extract_created(it))
+        except Exception:
+            pass
+
+def c_dlm(sess, agg, acct, part, region, threads: int):
+    svc="dlm"; cli=sess.client("dlm", region_name=region, config=boto_cfg())
+    try:
+        resp=call_boto(agg, cli, "get_lifecycle_policies", region=region, service=svc, rtype="policy", api_args={})
+        for p in resp.get("Policies", []):
+            pid=p.get("PolicyId",""); arn=f"arn:{part}:dlm:{region}:{acct}:policy/{pid}" if pid else ""
+            agg.add(region, svc, "policy", arn, pid, acct, "get_lifecycle_policies", "" if arn else "NotDerivable", extract_created(p))
+    except Exception:
+        pass
+
+def c_dms(sess, agg, acct, part, region, threads: int):
+    svc="dms"; cli=sess.client("dms", region_name=region, config=boto_cfg())
+    for api,rtype,key,arnk,idk in [
+        ("describe_replication_instances","replication-instance","ReplicationInstances","ReplicationInstanceArn","ReplicationInstanceIdentifier"),
+        ("describe_endpoints","endpoint","Endpoints","EndpointArn","EndpointIdentifier"),
+        ("describe_replication_tasks","replication-task","ReplicationTasks","ReplicationTaskArn","ReplicationTaskIdentifier")
+    ]:
+        try:
+            resp = call_boto(agg, cli, api, region=region, service=svc, rtype=rtype, api_args={})
+            for it in resp.get(key, []):
+                arn=it.get(arnk,""); rid=it.get(idk,"")
+                agg.add(region, svc, rtype, arn, rid, acct, api, "" if arn else "NotDerivable", extract_created(it))
+        except Exception:
+            pass
+
+def c_drs(sess, agg, acct, part, region, threads: int):
+    svc="drs"; cli=sess.client("drs", region_name=region, config=boto_cfg())
+    try:
+        resp=call_boto(agg, cli, "describe_source_servers", region=region, service=svc, rtype="source-server", api_args={})
+        for s in resp.get("items", []):
+            arn=s.get("arn","")
+            agg.add(region, svc, "source-server", arn if str(arn).startswith("arn:") else "", s.get("sourceServerID",""), acct, "describe_source_servers", "" if str(arn).startswith("arn:") else "NotDerivable", extract_created(s))
+    except Exception:
+        pass
+    try:
+        resp=call_boto(agg, cli, "list_replication_configuration_templates", region=region, service=svc, rtype="replication-config-template", api_args={})
+        for t in resp.get("items", []):
+            arn=t.get("arn",""); name=t.get("arn","").split("/")[-1]
+            agg.add(region, svc, "replication-config-template", arn, name, acct, "list_replication_configuration_templates", "" if arn else "NotDerivable", extract_created(t))
+    except Exception:
+        pass
+
+def c_elasticache(sess, agg, acct, part, region, threads: int):
+    svc="elasticache"; cli=sess.client("elasticache", region_name=region, config=boto_cfg())
+    try:
+        resp=call_boto(agg, cli, "describe_replication_groups", region=region, service=svc, rtype="replication-group", api_args={})
+        for g in resp.get("ReplicationGroups", []):
+            rid=g.get("ReplicationGroupId","")
+            arn=g.get("ARN") or (f"arn:{part}:elasticache:{region}:{acct}:replicationgroup:{rid}" if rid else "")
+            agg.add(region, svc, "replication-group", arn, rid, acct, "describe_replication_groups", "" if arn else "NotDerivable", extract_created(g))
+    except Exception:
+        pass
+    try:
+        resp=call_boto(agg, cli, "describe_cache_clusters", region=region, service=svc, rtype="cache-cluster", api_args={})
+        for c in resp.get("CacheClusters", []):
+            cid=c.get("CacheClusterId","")
+            arn=c.get("ARN") or (f"arn:{part}:elasticache:{region}:{acct}:cluster:{cid}" if cid else "")
+            agg.add(region, svc, "cache-cluster", arn, cid, acct, "describe_cache_clusters", "" if arn else "NotDerivable", extract_created(c))
+    except Exception:
+        pass
+
+def c_fms(sess, agg, acct, part, region, threads: int):
+    svc="fms"; cli=sess.client("fms", region_name=region, config=boto_cfg())
+    try:
+        resp=call_boto(agg, cli, "list_policies", region=region, service=svc, rtype="policy", api_args={})
+        for p in resp.get("PolicyList", []):
+            arn=p.get("PolicyArn",""); name=p.get("PolicyName","")
+            agg.add(region, svc, "policy", arn, name, acct, "list_policies", "" if arn else "NotDerivable", extract_created(p))
+    except Exception:
+        pass
+
+def c_lightsail(sess, agg, acct, part, region, threads: int):
+    svc="lightsail"; cli=sess.client("lightsail", region_name=region, config=boto_cfg())
+    try:
+        resp=call_boto(agg, cli, "get_instances", region=region, service=svc, rtype="instance", api_args={})
+        for i in resp.get("instances", []):
+            arn=i.get("arn",""); name=i.get("name","")
+            agg.add(region, svc, "instance", arn, name, acct, "get_instances", "" if arn else "NotDerivable", extract_created(i))
+    except Exception:
+        pass
+
+def c_macie(sess, agg, acct, part, region, threads: int):
+    svc="macie"; cli=sess.client("macie2", region_name=region, config=boto_cfg())
+    try:
+        resp=call_boto(agg, cli, "get_macie_session", region=region, service=svc, rtype="session", api_args={})
+        status=resp.get("status","UNKNOWN")
+        agg.add(region, svc, "session", "", status, acct, "get_macie_session", "NotDerivable", extract_created(resp))
+    except Exception:
+        pass
+
+def c_mq(sess, agg, acct, part, region, threads: int):
+    svc="mq"; cli=sess.client("mq", region_name=region, config=boto_cfg())
+    try:
+        resp=call_boto(agg, cli, "list_brokers", region=region, service=svc, rtype="broker", api_args={})
+        for b in resp.get("BrokerSummaries", []):
+            arn=b.get("BrokerArn",""); name=b.get("BrokerName","")
+            agg.add(region, svc, "broker", arn, name, acct, "list_brokers", "" if arn else "NotDerivable", extract_created(b))
+    except Exception:
+        pass
+
+def c_opensearch(sess, agg, acct, part, region, threads: int):
+    svc="opensearch"; cli=sess.client("opensearch", region_name=region, config=boto_cfg())
+    try:
+        resp=call_boto(agg, cli, "list_domain_names", region=region, service=svc, rtype="domain", api_args={})
+        for d in resp.get("DomainNames", []):
+            name=d.get("DomainName")
+            desc=call_boto(agg, cli, "describe_domain", region=region, service=svc, rtype="domain", api_args={"DomainName": name})
+            arn=desc.get("DomainStatus",{}).get("ARN","")
+            agg.add(region, svc, "domain", arn, name, acct, "describe_domain", "" if arn else "NotDerivable", extract_created(desc.get("DomainStatus",{})))
+    except Exception:
+        pass
+
+def c_ram(sess, agg, acct, part, region, threads: int):
+    svc="ram"; cli=sess.client("ram", region_name=region, config=boto_cfg())
+    try:
+        resp=call_boto(agg, cli, "list_resource_shares", region=region, service=svc, rtype="resource-share", api_args={"resourceOwner":"SELF"})
+        for rs in resp.get("resourceShares", []):
+            arn=rs.get("resourceShareArn",""); name=rs.get("name","")
+            agg.add(region, svc, "resource-share", arn, name, acct, "list_resource_shares", "" if arn else "NotDerivable", extract_created(rs))
+    except Exception:
+        pass
+    try:
+        resp=call_boto(agg, cli, "list_resources", region=region, service=svc, rtype="shared-resource", api_args={"resourceOwner":"SELF"})
+        for r in resp.get("resources", []):
+            arn=r.get("arn",""); name=arn.split(":")[-1] if arn else ""
+            agg.add(region, svc, "shared-resource", arn, name, acct, "list_resources", "" if arn else "NotDerivable", extract_created(r))
+    except Exception:
+        pass
+
+def c_resourceexplorer2(sess, agg, acct, part, region, threads: int):
+    svc="resourceexplorer2"; cli=sess.client("resource-explorer-2", region_name=region, config=boto_cfg())
+    try:
+        resp=call_boto(agg, cli, "list_views", region=region, service=svc, rtype="view", api_args={})
+        for v in resp.get("Views", []):
+            arn=v.get("ViewArn",""); name=v.get("Name","")
+            agg.add(region, svc, "view", arn, name, acct, "list_views", "" if arn else "NotDerivable", extract_created(v))
+    except Exception:
+        pass
+    try:
+        resp=call_boto(agg, cli, "list_indexes", region=region, service=svc, rtype="index", api_args={})
+        for ix in resp.get("Indexes", []):
+            arn=ix.get("Arn",""); name=ix.get("Region","")
+            agg.add(region, svc, "index", arn, name, acct, "list_indexes", "" if arn else "NotDerivable", extract_created(ix))
+    except Exception:
+        pass
+
+def c_route53resolver(sess, agg, acct, part, region, threads: int):
+    svc="route53resolver"; cli=sess.client("route53resolver", region_name=region, config=boto_cfg())
+    for spec in [("list_resolver_endpoints","ResolverEndpoints","resolver-endpoint","Arn","Name"),
+                 ("list_resolver_rules","ResolverRules","resolver-rule","Arn","Name")]:
+        try:
+            api,key,rtype,arnf,idf=spec; pg=cli.get_paginator(api)
+            for page in call_boto(agg, pg, "paginate", region=region, service=svc, rtype=rtype, api_args={}):
+                for it in page.get(key, []):
+                    arn=it.get(arnf,""); name=it.get(idf,"")
+                    agg.add(region, svc, rtype, arn, name, acct, api, "" if arn else "NotDerivable", extract_created(it))
+        except Exception:
+            pass
+
+def c_sagemaker(sess, agg, acct, part, region, threads: int):
+    svc="sagemaker"; cli=sess.client("sagemaker", region_name=region, config=boto_cfg())
+    try:
+        pg=cli.get_paginator("list_endpoints")
+        for page in call_boto(agg, pg, "paginate", region=region, service=svc, rtype="endpoint", api_args={}):
+            for e in page.get("Endpoints", []):
+                arn=e.get("EndpointArn",""); name=e.get("EndpointName","")
+                agg.add(region, svc, "endpoint", arn, name, acct, "list_endpoints", "" if arn else "NotDerivable", extract_created(e))
+    except Exception:
+        pass
+    try:
+        pg=cli.get_paginator("list_models")
+        for page in call_boto(agg, pg, "paginate", region=region, service=svc, rtype="model", api_args={}):
+            for m in page.get("Models", []):
+                arn=m.get("ModelArn",""); name=m.get("ModelName","")
+                agg.add(region, svc, "model", arn, name, acct, "list_models", "" if arn else "NotDerivable", extract_created(m))
+    except Exception:
+        pass
+    try:
+        pg=cli.get_paginator("list_notebook_instances")
+        for page in call_boto(agg, pg, "paginate", region=region, service=svc, rtype="notebook-instance", api_args={}):
+            for n in page.get("NotebookInstances", []):
+                name=n.get("NotebookInstanceName","")
+                d=call_boto(agg, cli, "describe_notebook_instance", region=region, service=svc, rtype="notebook-instance", api_args={"NotebookInstanceName": name})
+                arn=d.get("NotebookInstanceArn","")
+                agg.add(region, svc, "notebook-instance", arn, name, acct, "describe_notebook_instance", "" if arn else "NotDerivable", extract_created(d))
+    except Exception:
+        pass
+    try:
+        pg=cli.get_paginator("list_training_jobs")
+        for page in call_boto(agg, pg, "paginate", region=region, service=svc, rtype="training-job", api_args={}):
+            for t in page.get("TrainingJobSummaries", []):
+                name=t.get("TrainingJobName","")
+                d=call_boto(agg, cli, "describe_training_job", region=region, service=svc, rtype="training-job", api_args={"TrainingJobName": name})
+                arn=d.get("TrainingJobArn","")
+                agg.add(region, svc, "training-job", arn, name, acct, "describe_training_job", "" if arn else "NotDerivable", extract_created(d))
+    except Exception:
+        pass
+
+def c_ses(sess, agg, acct, part, region, threads: int):
+    svc="ses"; cli=sess.client("sesv2", region_name=region, config=boto_cfg())
+    try:
+        pg=cli.get_paginator("list_email_identities")
+        for page in call_boto(agg, pg, "paginate", region=region, service=svc, rtype="email-identity", api_args={}):
+            for i in page.get("EmailIdentities", []):
+                name=i.get("IdentityName","")
+                agg.add(region, svc, "email-identity", "", name, acct, "list_email_identities", "NotDerivable", extract_created(i))
+    except Exception:
+        pass
+
+def c_shield(sess, agg, acct, part, region, threads: int):
+    svc="shield"
+    try:
+        cli=sess.client("shield", region_name="us-east-1", config=boto_cfg())
+        resp=call_boto(agg, cli, "list_protections", region="global", service=svc, rtype="protection", api_args={})
+        for p in resp.get("Protections", []) or []:
+            arn = p.get("ProtectionArn") or p.get("ResourceArn","")
+            name=p.get("Name","")
+            if arn and str(arn).startswith("arn:"):
+                agg.add("global", svc, "protection", arn, name, acct, "list_protections", "", extract_created(p))
+            else:
+                agg.add("global", svc, "protection", "", name, acct, "list_protections", "NotDerivable", extract_created(p))
+    except Exception:
+        pass
+
+def c_ssm(sess, agg, acct, part, region, threads: int):
+    svc="ssm"; cli=sess.client("ssm", region_name=region, config=boto_cfg())
+    try:
+        pg=cli.get_paginator("describe_parameters")
+        for page in call_boto(agg, pg, "paginate", region=region, service=svc, rtype="parameter", api_args={}):
+            for p in page.get("Parameters", []):
+                arn=p.get("ARN",""); name=p.get("Name","")
+                agg.add(region, svc, "parameter", arn if arn else "", name, acct, "describe_parameters", "" if arn else "NotDerivable", extract_created(p))
+    except Exception:
+        pass
+
+def c_ssmcontacts(sess, agg, acct, part, region, threads: int):
+    svc="ssmcontacts"; cli=sess.client("ssm-contacts", region_name=region, config=boto_cfg())
+    try:
+        pg=cli.get_paginator("list_contacts")
+        for page in call_boto(agg, pg, "paginate", region=region, service=svc, rtype="contact", api_args={}):
+            for c in page.get("Contacts", []):
+                arn=c.get("Arn",""); alias=c.get("Alias","")
+                agg.add(region, svc, "contact", arn, alias, acct, "list_contacts", "" if arn else "NotDerivable", extract_created(c))
+    except Exception:
+        pass
+
+def c_ssmincidents(sess, agg, acct, part, region, threads: int):
+    svc="ssmincidents"; cli=sess.client("ssm-incidents", region_name=region, config=boto_cfg())
+    try:
+        pg=cli.get_paginator("list_response_plans")
+        for page in call_boto(agg, pg, "paginate", region=region, service=svc, rtype="response-plan", api_args={}):
+            for rp in page.get("ResponsePlanSummaries", []):
+                arn=rp.get("Arn",""); name=rp.get("Name","")
+                agg.add(region, svc, "response-plan", arn, name, acct, "list_response_plans", "" if arn else "NotDerivable", extract_created(rp))
+    except Exception:
+        pass
+
+def c_stepfunctions(sess, agg, acct, part, region, threads: int):
+    svc="stepfunctions"; cli=sess.client("stepfunctions", region_name=region, config=boto_cfg())
+    try:
+        resp=call_boto(agg, cli, "list_state_machines", region=region, service=svc, rtype="state-machine", api_args={})
+        for sm in resp.get("stateMachines", []):
+            arn=sm.get("stateMachineArn",""); name=sm.get("name","")
+            agg.add(region, svc, "state-machine", arn, name, acct, "list_state_machines", "" if arn else "NotDerivable", extract_created(sm))
+    except Exception:
+        pass
+
+def c_storagegateway(sess, agg, acct, part, region, threads: int):
+    svc="storagegateway"; cli=sess.client("storagegateway", region_name=region, config=boto_cfg())
+    try:
+        resp=call_boto(agg, cli, "list_gateways", region=region, service=svc, rtype="gateway", api_args={})
+        for g in resp.get("Gateways", []):
+            arn=g.get("GatewayARN",""); name=g.get("GatewayId","")
+            agg.add(region, svc, "gateway", arn, name, acct, "list_gateways", "" if arn else "NotDerivable", extract_created(g))
+    except Exception:
+        pass
+
+def c_wellarchitected(sess, agg, acct, part, region, threads: int):
+    svc="wellarchitected"; cli=sess.client("wellarchitected", region_name=region, config=boto_cfg())
+    try:
+        pg=cli.get_paginator("list_workloads")
+        for page in call_boto(agg, pg, "paginate", region=region, service=svc, rtype="workload", api_args={}):
+            for w in page.get("WorkloadSummaries", []):
+                arn=w.get("WorkloadArn",""); name=w.get("WorkloadName","")
+                agg.add(region, svc, "workload", arn, name, acct, "list_workloads", "" if arn else "NotDerivable", extract_created(w))
+    except Exception:
+        pass
+
+def c_workspaces(sess, agg, acct, part, region, threads: int):
+    svc="workspaces"; cli=sess.client("workspaces", region_name=region, config=boto_cfg())
+    try:
+        pg=cli.get_paginator("describe_workspaces")
+        for page in call_boto(agg, pg, "paginate", region=region, service=svc, rtype="workspace", api_args={}):
+            for w in page.get("Workspaces", []):
+                wid=w.get("WorkspaceId","")
+                arn=f"arn:{part}:workspaces:{region}:{acct}:workspace/{wid}" if wid else ""
+                agg.add(region, svc, "workspace", arn, wid, acct, "describe_workspaces", "" if arn else "NotDerivable", extract_created(w))
+    except Exception:
+        pass
+
+def c_emr(sess, agg, acct, part, region, threads: int):
+    svc="emr"; cli=sess.client("emr", region_name=region, config=boto_cfg())
+    try:
+        resp=call_boto(agg, cli, "list_clusters", region=region, service=svc, rtype="cluster", api_args={})
+        for c in resp.get("Clusters", []):
+            cid=c.get("Id",""); arn=f"arn:{part}:elasticmapreduce:{region}:{acct}:cluster/{cid}" if cid else ""
+            agg.add(region, svc, "cluster", arn, cid, acct, "list_clusters", "" if arn else "NotDerivable", extract_created(c))
+    except Exception:
+        pass
+
+def c_emrserverless(sess, agg, acct, part, region, threads: int):
+    svc="emrserverless"; cli=sess.client("emr-serverless", region_name=region, config=boto_cfg())
+    try:
+        resp=call_boto(agg, cli, "list_applications", region=region, service=svc, rtype="application", api_args={})
+        for a in resp.get("applications", []):
+            arn=a.get("arn",""); name=a.get("name","")
+            agg.add(region, svc, "application", arn, name, acct, "list_applications", "" if arn else "NotDerivable", extract_created(a))
+    except Exception:
+        pass
+
+def c_elasticbeanstalk(sess, agg, acct, part, region, threads: int):
+    svc="elasticbeanstalk"; cli=sess.client("elasticbeanstalk", region_name=region, config=boto_cfg())
+    try:
+        resp=call_boto(agg, cli, "describe_applications", region=region, service=svc, rtype="application", api_args={})
+        for a in resp.get("Applications", []):
+            arn=a.get("ApplicationArn",""); name=a.get("ApplicationName","")
+            agg.add(region, svc, "application", arn, name, acct, "describe_applications", "" if arn else "NotDerivable", extract_created(a))
+    except Exception:
+        pass
+    try:
+        resp=call_boto(agg, cli, "describe_environments", region=region, service=svc, rtype="environment", api_args={})
+        for e in resp.get("Environments", []):
+            arn=e.get("EnvironmentArn",""); name=e.get("EnvironmentName","")
+            agg.add(region, svc, "environment", arn, name, acct, "describe_environments", "" if arn else "NotDerivable", extract_created(e))
+    except Exception:
+        pass
+
+def c_glacier(sess, agg, acct, part, region, threads: int):
+    svc="glacier"; cli=sess.client("glacier", region_name=region, config=boto_cfg())
+    try:
+        pg=cli.get_paginator("list_vaults")
+        for page in call_boto(agg, pg, "paginate", region=region, service=svc, rtype="vault", api_args={"accountId":"-"}):
+            for v in page.get("VaultList", []):
+                arn=v.get("VaultARN",""); name=v.get("VaultName","")
+                agg.add(region, svc, "vault", arn, name, acct, "list_vaults", "" if arn else "NotDerivable", extract_created(v))
+    except Exception:
+        pass
+
+def c_memorydb(sess, agg, acct, part, region, threads: int):
+    svc="memorydb"; cli=sess.client("memorydb", region_name=region, config=boto_cfg())
+    try:
+        resp=call_boto(agg, cli, "describe_clusters", region=region, service=svc, rtype="cluster", api_args={})
+        for c in resp.get("Clusters", []):
+            arn=c.get("ARN",""); name=c.get("Name","")
+            agg.add(region, svc, "cluster", arn, name, acct, "describe_clusters", "" if arn else "NotDerivable", extract_created(c))
+    except Exception:
+        pass
+
+def c_servicecatalog(sess, agg, acct, part, region, threads: int):
+    svc="servicecatalog"; cli=sess.client("servicecatalog", region_name=region, config=boto_cfg())
+    try:
+        pg=cli.get_paginator("list_portfolios")
+        for page in call_boto(agg, pg, "paginate", region=region, service=svc, rtype="portfolio", api_args={}):
+            for p in page.get("PortfolioDetails", []):
+                arn=p.get("ARN",""); name=p.get("DisplayName","") or p.get("Id","")
+                agg.add(region, svc, "portfolio", arn, name, acct, "list_portfolios", "" if arn else "NotDerivable", extract_created(p))
+    except Exception:
+        pass
+
+def c_xray(sess, agg, acct, part, region, threads: int):
+    svc="xray"; cli=sess.client("xray", region_name=region, config=boto_cfg())
+    try:
+        resp=call_boto(agg, cli, "get_groups", region=region, service=svc, rtype="group", api_args={})
+        for g in resp.get("Groups", []):
+            arn=g.get("GroupARN",""); name=g.get("GroupName","")
+            agg.add(region, svc, "group", arn, name, acct, "get_groups", "" if arn else "NotDerivable", extract_created(g))
+    except Exception:
+        pass
+    try:
+        resp=call_boto(agg, cli, "get_sampling_rules", region=region, service=svc, rtype="sampling-rule", api_args={})
+        for r in resp.get("SamplingRuleRecords", []):
+            arn=r.get("SamplingRule",{}).get("RuleARN",""); name=r.get("SamplingRule",{}).get("RuleName","")
+            agg.add(region, svc, "sampling-rule", arn, name, acct, "get_sampling_rules", "" if arn else "NotDerivable", extract_created(r))
+    except Exception:
+        pass
+
+# --------- Global-only collectors ----------
+def c_cloudfront_global(sess, agg, acct, part):
+    svc="cloudfront"; cli=sess.client("cloudfront", region_name="us-east-1", config=boto_cfg())
+    try:
+        pg = cli.get_paginator("list_distributions")
+        for page in call_boto(agg, pg, "paginate", region="global", service=svc, rtype="distribution", api_args={}):
+            for it in (page.get("DistributionList",{}).get("Items",[]) or []):
+                arn=it.get("ARN",""); id_=it.get("Id","")
+                agg.add("global", svc, "distribution", arn, id_, acct, "list_distributions", "" if arn else "NotDerivable", extract_created(it))
+    except Exception:
+        pass
+
+def c_route53_global(sess, agg, acct, part):
+    svc="route53"; cli=sess.client("route53", region_name="us-east-1", config=boto_cfg())
+    try:
+        pg=cli.get_paginator("list_hosted_zones")
+        for page in call_boto(agg, pg, "paginate", region="global", service=svc, rtype="hosted-zone", api_args={}):
+            for z in page.get("HostedZones", []):
+                zid=z.get("Id","").split("/")[-1]; name=z.get("Name","")
+                arn=f"arn:{part}:route53:::hostedzone/{zid}" if zid else ""
+                # Created time not directly exposed here
+                agg.add("global", svc, "hosted-zone", arn, name or zid, acct, "list_hosted_zones", "" if arn else "NotDerivable", extract_created(z))
+    except Exception:
+        pass
+
+def c_iam_global(sess, agg, acct, part):
+    svc="iam"; cli=sess.client("iam", region_name="us-east-1", config=boto_cfg())
+    def add(api,key,rtype,arn_field,id_field):
+        try:
+            pg=cli.get_paginator(api)
+            for page in call_boto(agg, pg, "paginate", region="global", service=svc, rtype=rtype, api_args={}):
+                for it in page.get(key, []):
+                    arn=it.get(arn_field,""); rid=it.get(id_field,"")
+                    agg.add("global", svc, rtype, arn, rid, acct, api, "" if arn else "NotDerivable", extract_created(it))
+        except Exception:
+            pass
+    add("list_users","Users","user","Arn","UserName")
+    add("list_roles","Roles","role","Arn","RoleName")
+    add("list_groups","Groups","group","Arn","GroupName")
+    # Policies (All) — includes AWS-managed + customer-managed
+    try:
+        pg=cli.get_paginator("list_policies")
+        for page in call_boto(agg, pg, "paginate", region="global", service=svc, rtype="policy", api_args={"Scope": "All"}):
+            for it in page.get("Policies", []):
+                arn=it.get("Arn",""); rid=it.get("PolicyName","")
+                agg.add("global", svc, "policy", arn, rid, acct, "list_policies(Scope=All)", "" if arn else "NotDerivable", extract_created(it))
+    except Exception:
+        pass
+
+def c_organizations_global(sess, agg, acct, part):
+    svc="organizations"; cli=sess.client("organizations", region_name="us-east-1", config=boto_cfg())
+    try:
+        o=call_boto(agg, cli, "describe_organization", region="global", service=svc, rtype="organization", api_args={}).get("Organization", {})
+        arn=o.get("Arn","")
+        agg.add("global", svc, "organization", arn, o.get("Id",""), acct, "describe_organization", "" if arn else "NotDerivable", extract_created(o))
+    except Exception:
+        pass
+
+def c_budgets_global(sess, agg, acct, part):
+    svc="budgets"; cli=sess.client("budgets", region_name="us-east-1", config=boto_cfg())
+    try:
+        pg=cli.get_paginator("describe_budgets")
+        for page in call_boto(agg, pg, "paginate", region="global", service=svc, rtype="budget", api_args={"AccountId": acct}):
+            for b in page.get("Budgets", []):
+                name=b.get("BudgetName","")
+                arn=f"arn:{part}:budgets::{acct}:budget/{name}" if name else ""
+                agg.add("global", svc, "budget", arn, name, acct, "describe_budgets", "" if arn else "NotDerivable", extract_created(b))
+    except Exception:
+        pass
+
+# Mark services with no listable ARNs as NotApplicable (still logged)
+def add_not_applicable(agg: LocalAgg, service: str):
+    agg.log_attempt("global", service, "n/a", "n/a", {})
+    agg.log_error("global", service, "n/a", "n/a", "NotApplicable", "No listable ARNs via public APIs.")
+    agg.add("global", service, "n/a", "", "", "", "n/a", "NotApplicable", "")
+
+# -------------------- Registry --------------------
+# Union of your lists; aliases folded
+REQUESTED = [
+ "accessanalyzer","account","acm","apigateway","apigatewayv2","appconfig","appstream","appsync","athena",
+ "auditmanager","autoscaling","backup","batch","bedrock","budgets","cloudformation","cloudfront","cloudtrail",
+ "cloudwatch","codeartifact","codebuild","codecommit","codedeploy","codepipeline","cognito","config","detective",
+ "directconnect","directoryservice","datasync","dlm","dms","docdb","documentdb","drs","dynamodb","ebs","ec2","ecr","ecs","efs","eks",
+ "elasticache","elasticbeanstalk","elb","elbv2","emr","emrserverless","eventbridge","firehose","fms","fsx","glacier",
+ "glue","guardduty","iam","inspector","inspector2","kafka","kinesis","kms","lambda","awslambda","lightsail","logs",
+ "macie","memorydb","mq","msk","neptune","networkfirewall","opensearch","organizations","ram","rds","redshift","resourceexplorer2",
+ "route53","route53resolver","s3","sagemaker","secretsmanager","securityhub","servicecatalog","ses","shield","sns","sqs","ssm","ssmcontacts","ssmincidents",
+ "stepfunctions","storagegateway","sts","transfer","waf","wafv2","wellarchitected","workspaces","xray","support","trustedadvisor","vpc"
+]
+
+ALIASES = {
+    "awslambda": "lambda",
+    "documentdb": "docdb",
+    "msk": "kafka",
+    "vpc": "ec2",  # covered by ec2 collector with service label "vpc"
+}
+
+def canon(svc: str) -> str:
+    return ALIASES.get(svc, svc)
+
+# Map service -> collector (regional); ones not present will be logged as NotImplemented
+REGIONAL = {
+  "ec2": c_ec2, "ebs": c_ebs, "ecr": c_ecr, "ecs": c_ecs, "eks": c_eks,
+  "rds": c_rds, "redshift": lambda *a, **k: None,  # covered below as simple cluster list (see c_redshift)
+  "dynamodb": c_dynamodb, "docdb": c_docdb, "neptune": c_neptune,
+  "efs": c_efs, "fsx": c_fsx, "apigateway": c_apigw, "apigatewayv2": c_apigw2,
+  "eventbridge": c_events, "route53resolver": c_route53resolver,
+  "elbv2": c_elbv2, "elb": c_elb, "cloudtrail": c_cloudtrail,
+  "kms": c_kms, "secretsmanager": c_secrets, "guardduty": c_guardduty,
+  "securityhub": c_securityhub, "wafv2": c_wafv2, "networkfirewall": c_networkfirewall,
+  "accessanalyzer": c_accessanalyzer, "inspector": c_inspector, "inspector2": c_inspector2,
+  "macie": c_macie, "fms": c_fms, "shield": c_shield,
+  "kinesis": c_kinesis, "firehose": c_firehose, "sns": c_sns, "sqs": c_sqs, "kafka": c_kafka,
+  "cloudwatch": c_cloudwatch, "logs": c_logs,
+  "config": c_config, "auditmanager": c_auditmanager, "wellarchitected": c_wellarchitected,
+  "appconfig": c_appconfig, "resourceexplorer2": c_resourceexplorer2, "ram": c_ram,
+  "transfer": c_transfer, "storagegateway": c_storagegateway, "datasync": c_datasync,
+  "directconnect": c_directconnect, "directoryservice": c_directoryservice,
+  "lightsail": c_lightsail, "emr": c_emr, "emrserverless": c_emrserverless,
+  "elasticache": c_elasticache, "mq": c_mq, "sagemaker": c_sagemaker, "ses": c_ses,
+  "bedrock": c_bedrock, "appstream": c_appstream, "appsync": c_appsync, "acm": c_acm,
+  "detective": c_detective, "dlm": c_dlm, "dms": c_dms, "drs": c_drs,
+  "ssm": c_ssm, "ssmcontacts": c_ssmcontacts, "ssmincidents": c_ssmincidents,
+  "glacier": c_glacier, "elasticbeanstalk": c_elasticbeanstalk, "athena": c_athena, "glue": c_glue,
+  "opensearch": c_opensearch, "workspaces": c_workspaces, "memorydb": c_memorydb, "xray": c_xray,
+  # redshift covered by its own collector below (simple)
+}
+
+def c_redshift(sess, agg, acct, part, region, threads: int):
+    svc="redshift"; cli=sess.client("redshift", region_name=region, config=boto_cfg())
+    try:
+        pg=cli.get_paginator("describe_clusters")
+        for page in call_boto(agg, pg, "paginate", region=region, service=svc, rtype="cluster", api_args={}):
+            for c in page.get("Clusters", []):
+                arn = c.get("ClusterNamespaceArn") or (f"arn:{part}:redshift:{region}:{acct}:cluster:{c.get('ClusterIdentifier','')}")
+                name=c.get("ClusterIdentifier","")
+                agg.add(region, svc, "cluster", arn, name, acct, "describe_clusters", "" if arn else "NotDerivable", extract_created(c))
+    except Exception:
+        pass
+
+REGIONAL["redshift"] = c_redshift
+
+GLOBAL_ONLY = {
+  "iam": c_iam_global, "cloudfront": c_cloudfront_global, "route53": c_route53_global,
+  "organizations": c_organizations_global, "budgets": c_budgets_global,
+  # these are logged as NotApplicable (no listable ARNs)
+  "support": None, "trustedadvisor": None, "sts": None, "account": None, "waf": None,
+}
+
+# -------------------- Output writers --------------------
+def write_excel(path: str, rows_by_sheet: Dict[str, List[List[str]]], regions: List[str]):
+    wb = Workbook()
+    ws0 = wb.active
+    ws0.title = "global"
+    def write_sheet(name: str, rows: List[List[str]]):
+        ws = wb[name] if name in wb.sheetnames else wb.create_sheet(title=name)
+        if ws.max_row == 1 and ws["A1"].value is None: ws.append(HEADERS)
+        for r in rows: ws.append(r)
+        for ci in range(1, len(HEADERS)+1):
+            ws.column_dimensions[get_column_letter(ci)].width = 28
+    # global first
+    write_sheet("global", rows_by_sheet.get("global", []))
+    # always create all specified regions (even if empty)
+    for reg in regions:
+        write_sheet(reg, rows_by_sheet.get(reg, []))
+    wb.save(path)
+
+def write_summary(path: str, all_rows: List[List[str]]):
+    by_service = defaultdict(int)
+    by_service_type = defaultdict(int)
+    by_region = defaultdict(int)
+    total = 0
+    for row in all_rows:
+        region, service, rtype, arn = row[0], row[1], row[2], row[3]
+        if arn:
+            by_service[service] += 1
+            by_service_type[(service,rtype)] += 1
+            by_region[region] += 1
+            total += 1
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("[By Service]\n")
+        for svc,cnt in sorted(by_service.items(), key=lambda x:(-x[1],x[0])):
+            f.write(f"{svc}: {cnt}\n")
+        f.write("\n[By Service → ResourceType]\n")
+        for (svc,rt),cnt in sorted(by_service_type.items(), key=lambda x:(-x[1],x[0][0],x[0][1])):
+            f.write(f"{svc} → {rt}: {cnt}\n")
+        f.write("\n[By Region]\n")
+        for reg,cnt in sorted(by_region.items(), key=lambda x:(-x[1],x[0])):
+            f.write(f"{reg}: {cnt}\n")
+        f.write(f"\n[Account Total]\nTotal ARNs: {total}\n")
+
+# -------------------- Task runner --------------------
+def run_task(service: str, region: str, profile: str, acct: str, part: str, threads: int):
+    agg = LocalAgg()
+    try:
+        # S3 (global) handled once at the end as its own task 's3/global'
+        if service in GLOBAL_ONLY:
+            fn = GLOBAL_ONLY[service]
+            if fn is None:
+                add_not_applicable(agg, service)
+            else:
+                sess = build_session(profile, GLOBAL_HOME.get(service, "us-east-1"))
+                fn(sess, agg, acct, part)
+        elif service == "s3" and region == "global":
+            sess = build_session(profile, "us-east-1")
+            collect_s3(sess, agg, acct, part)
+        else:
+            fn = REGIONAL.get(service)
+            if fn is None:
+                # Log NotImplemented (still recorded)
+                agg.log_attempt(region, service, "n/a", "n/a", {})
+                agg.log_error(region, service, "n/a", "n/a", "NotImplemented", "Collector not wired.")
+                agg.add(region, service, "n/a", "", "", "", "n/a", "NotImplemented", "")
+            else:
+                sess = build_session(profile, region)
+                fn(sess, agg, acct, part, region, threads)
+    except Exception as e:
+        agg.log_error(region if service not in GLOBAL_ONLY else "global", service, "n/a", "TASK", "TaskFailed", f"{type(e).__name__}: {e}")
+    return {"service": service, "region": region, "rows": agg.rows, "attempted": agg.attempted, "errors": agg.errors}
+
+# -------------------- Main --------------------
+def main():
+    ap = argparse.ArgumentParser(description="AWS ARN Inventory (MP)")
+    ap.add_argument("--profile", default="default", help="AWS profile name")
+    ap.add_argument("--max-proc", type=int, default=min(64, max(8, (os.cpu_count() or 4)*3)), help="Max processes")
+    ap.add_argument("--per-region-threads", type=int, default=0, help="Threads per process for heavy inner loops (0/1 disables)")
+    ap.add_argument("--output", default="aws-arns.xlsx", help="Output Excel filename")
+    ap.add_argument("--logdir", default="logs", help="Logs directory")
+    args = ap.parse_args()
+
+    os.makedirs(args.logdir, exist_ok=True)
+    attempted_path = os.path.join(args.logdir, "attempted_apis.txt")
+    errors_path = os.path.join(args.logdir, "errors.txt")
+    summary_path = os.path.join(args.logdir, "summary_counts.txt")
+    for p in (attempted_path, errors_path, summary_path):
+        if os.path.exists(p): os.remove(p)
+
+    base = build_session(args.profile, "us-east-1")
+    acct, part = get_acct_partition(base)
+
+    # Canonicalize service list and build tasks
+    requested = sorted(set(canon(s) for s in REQUESTED))
+    tasks: List[Tuple[str,str]] = []
+
+    # Global tasks
+    for svc in requested:
+        if svc in GLOBAL_ONLY:
+            tasks.append((svc, "global"))
+    # S3 global
+    tasks.append(("s3","global"))
+    # Regional tasks (strictly in your hard-coded regions)
+    regional_svcs = [s for s in requested if s not in GLOBAL_ONLY and s != "s3"]
+    for r in REGIONS:
+        for s in regional_svcs:
+            tasks.append((s, r))
+
+    # Fan out with processes
+    all_rows_by_sheet: Dict[str, List[List[str]]] = defaultdict(list)
+    all_rows_flat: List[List[str]] = []
+    total = len(tasks)
+    with ProcessPoolExecutor(max_workers=args.max_proc) as ex, tqdm(total=total, desc="Inventory", dynamic_ncols=True) as pbar:
+        futs = [ex.submit(run_task, s, r, args.profile, acct, part, args.per_region_threads) for (s, r) in tasks]
+        for f in as_completed(futs):
+            res = f.result()
+            # merge rows
+            for row in res["rows"]:
+                sheet = "global" if row[0] == "global" else row[0]
+                all_rows_by_sheet[sheet].append(row)
+                all_rows_flat.append(row)
+            # append logs
+            if res["attempted"]:
+                with open(attempted_path, "a", encoding="utf-8") as fa:
+                    fa.write("\n".join(res["attempted"]) + "\n")
+            if res["errors"]:
+                with open(errors_path, "a", encoding="utf-8") as fe:
+                    fe.write("\n".join(res["errors"]) + "\n")
+            pbar.update(1)
+
+    # Write outputs
+    write_excel(args.output, all_rows_by_sheet, REGIONS)
+    write_summary(summary_path, all_rows_flat)
+    print(f"Done.\nExcel: {args.output}\nLogs: {attempted_path}, {errors_path}, {summary_path}")
+
+if __name__ == "__main__":
+    main()
