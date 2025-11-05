@@ -3,23 +3,28 @@
 # Rule: NOT_COMPLIANT if subnet's route table has igw-* OR 0.0.0.0/0; else COMPLIANT.
 # Output: summary counts (no per-instance prints).
 
-set -u
 export AWS_PAGER=""
 
-# -------- Colors --------
+# ---- Colors & helpers ----
 BOLD=$'\033[1m'; DIM=$'\033[2m'; RESET=$'\033[0m'
 GREEN=$'\033[32m'; RED=$'\033[31m'; YELLOW=$'\033[33m'
 
-hr(){ local w; w=$(tput cols 2>/dev/null || echo 80); printf '%*s\n' "$w" '' | tr ' ' '-'; }
-need(){ command -v "$1" >/dev/null 2>&1 || { echo "Missing dependency: $1"; exit 1; }; }
+hr() {
+  cols=$(tput cols 2>/dev/null || echo 80)
+  printf '%*s\n' "$cols" '' | tr ' ' '-'
+}
+need() { command -v "$1" >/dev/null 2>&1 || { echo "Missing dependency: $1"; exit 1; }; }
 need aws
 need awk
 
-JOBS="${JOBS:-16}"               # override: JOBS=24 ./ec2_check.sh --all
-[[ "$JOBS" =~ ^[0-9]+$ ]] || JOBS=16
-(( JOBS < 1 )) && JOBS=1
+# ---- Workers (override with: JOBS=24 ./ec2_check.sh ...) ----
+JOBS="${JOBS:-16}"
+case "$JOBS" in
+  (''|*[!0-9]*) JOBS=16;;
+esac
+[ "$JOBS" -lt 1 ] && JOBS=1
 
-# -------- Region resolution --------
+# ---- Region selection ----
 REGION_ARG="${1:-}"
 if [ "$REGION_ARG" = "--all" ]; then
   REGIONS="$(aws ec2 describe-regions --query 'Regions[].RegionName' --output text 2>/dev/null)"
@@ -31,17 +36,17 @@ else
   else REGIONS="$(aws ec2 describe-regions --query 'Regions[].RegionName' --output text 2>/dev/null)"
   fi
 fi
-[ -z "${REGIONS:-}" ] && { echo "No regions resolved. Set a default region or pass one/--all."; exit 1; }
+[ -z "$REGIONS" ] && { echo "No regions resolved. Set a default region or pass one/--all."; exit 1; }
 
 ACCOUNT="$(aws sts get-caller-identity --query 'Account' --output text 2>/dev/null || echo UNKNOWN)"
 ARN="$(aws sts get-caller-identity --query 'Arn' --output text 2>/dev/null || echo UNKNOWN)"
 
-# -------- Temp files & cleanup --------
+# ---- Temp files ----
 TMP_INST="$(mktemp -t ec2_inst.XXXXXX)"
 TMP_RES="$(mktemp -t ec2_res.XXXXXX)"
 trap 'rm -f "$TMP_INST" "$TMP_RES" 2>/dev/null || true' EXIT
 
-# -------- Collect all instances (region, iid, subnet, vpc) --------
+# ---- Collect instances (region, iid, subnet, vpc) ----
 for REGION in $REGIONS; do
   aws ec2 describe-instances --region "$REGION" \
     --query 'Reservations[].Instances[].[InstanceId, SubnetId, VpcId]' \
@@ -50,7 +55,7 @@ for REGION in $REGIONS; do
 done
 
 TOTAL="$(wc -l < "$TMP_INST" 2>/dev/null | tr -d ' ')"
-TOTAL="${TOTAL:-0}"
+[ -z "$TOTAL" ] && TOTAL=0
 
 echo
 echo "${BOLD}EC2 Public Subnet Audit${RESET}"
@@ -69,56 +74,68 @@ if [ "$TOTAL" -eq 0 ]; then
   exit 0
 fi
 
-# -------- Progress bar --------
+# ---- Progress bar ----
 draw_progress() {
   # args: done total
-  local done="$1" total="$2" cols barw filled empty pct
-  cols="$(tput cols 2>/dev/null || echo 80)"
-  barw=$(( cols - 36 )); [ "$barw" -lt 10 ] && barw=10
-  filled=$(( total>0 ? (done * barw / total) : 0 ))
-  (( filled < 0 )) && filled=0
-  (( filled > barw )) && filled=$barw
+  done_amt="$1"
+  total_amt="$2"
+  cols=$(tput cols 2>/dev/null || echo 80)
+  barw=$(( cols - 36 ))
+  if [ "$barw" -lt 10 ]; then barw=10; fi
+  if [ "$total_amt" -gt 0 ]; then
+    filled=$(( done_amt * barw / total_amt ))
+  else
+    filled=0
+  fi
+  if [ "$filled" -lt 0 ]; then filled=0; fi
+  if [ "$filled" -gt "$barw" ]; then filled="$barw"; fi
   empty=$(( barw - filled ))
-  pct=$(( total>0 ? (done * 100 / total) : 0 ))
+  if [ "$total_amt" -gt 0 ]; then
+    pct=$(( done_amt * 100 / total_amt ))
+  else
+    pct=0
+  fi
   printf "\rProcessing: ["
-  if [ "$filled" -gt 0 ]; then for ((i=0;i<filled;i++)); do printf "#"; done; fi
-  if [ "$empty" -gt 0 ]; then for ((i=0;i<empty;i++)); do printf "-"; done; fi
-  printf "] %3d%% (%d/%d)" "$pct" "$done" "$total"
+  i=0; while [ $i -lt $filled ]; do printf "#"; i=$((i+1)); done
+  i=0; while [ $i -lt $empty  ]; do printf "-"; i=$((i+1)); done
+  printf "] %3d%% (%d/%d)" "$pct" "$done_amt" "$total_amt"
 }
 
 progress_loop() {
-  # args: results_file total
-  local res_file="$1" total="$2" done_prev=-1 done_now=0
+  # args: res_file total
+  res_file="$1"
+  total_amt="$2"
+  done_prev=-1
+  done_now=0
   while :; do
     done_now="$(wc -l < "$res_file" 2>/dev/null | tr -d ' ')"
     [ -z "$done_now" ] && done_now=0
     if [ "$done_now" -ne "$done_prev" ]; then
-      draw_progress "$done_now" "$total"
+      draw_progress "$done_now" "$total_amt"
       done_prev="$done_now"
     fi
-    [ "$done_now" -ge "$total" ] && break
+    if [ "$done_now" -ge "$total_amt" ]; then break; fi
     sleep 0.2
   done
   echo
 }
 
-# -------- Concurrency semaphore (portable, Bash 3 OK) --------
+# ---- Semaphore for parallelism (Bash 3 compatible) ----
 SEM="$(mktemp -u)"; mkfifo "$SEM" || { echo "mkfifo failed"; exit 1; }
 exec 3<>"$SEM"; rm -f "$SEM"
-for ((k=0; k<JOBS; k++)); do echo >&3; done
+k=0; while [ $k -lt "$JOBS" ]; do echo >&3; k=$((k+1)); done
 
-# -------- Worker: check one instance --------
+# ---- Worker: check one instance ----
 check_one() {
-  local region="$1" iid="$2" subnet="$3" vpc="$4"
+  region="$1"; iid="$2"; subnet="$3"; vpc="$4"
 
-  # No subnet? skip.
+  # No subnet ⇒ skipped
   if [ -z "$subnet" ] || [ "$subnet" = "None" ]; then
     printf "SKIPPED\t%s\t%s\n" "$region" "$iid" >> "$TMP_RES"
     return
   fi
 
-  # Find route table: subnet assoc → else VPC main
-  local rtb
+  # Route table for subnet; else VPC main
   rtb="$(aws ec2 describe-route-tables --region "$region" \
         --filters "Name=association.subnet-id,Values=$subnet" \
         --query 'RouteTables[0].RouteTableId' --output text 2>/dev/null)"
@@ -132,11 +149,11 @@ check_one() {
     return
   fi
 
-  # Get route basics and decide public/private
-  local routes is_public=0
   routes="$(aws ec2 describe-route-tables --region "$region" --route-table-ids "$rtb" \
            --query 'RouteTables[].Routes[].{gw:GatewayId,dst:DestinationCidrBlock}' \
            --output text 2>/dev/null)"
+
+  is_public=0
   echo "$routes" | grep -qE '(^|[[:space:]])igw-[a-z0-9]+' && is_public=1
   echo "$routes" | grep -q '0.0.0.0/0' && is_public=1
 
@@ -147,7 +164,7 @@ check_one() {
   fi
 }
 
-# -------- Launch progress + workers --------
+# ---- Start progress and workers ----
 progress_loop "$TMP_RES" "$TOTAL" & PROG_PID=$!
 
 # Queue jobs
@@ -161,18 +178,17 @@ while IFS=$'\t' read -r region iid subnet vpc; do
   } &
 done < "$TMP_INST"
 
-# Wait for all workers
+# Wait for all jobs & progress
 wait
-# Wait for progress to finish
 wait "$PROG_PID" 2>/dev/null || true
 
-# -------- Aggregate counts --------
+# ---- Aggregate counts ----
 COMPLIANT_COUNT="$(awk -F'\t' '$1=="COMPLIANT"{c++} END{print c+0}' "$TMP_RES")"
 NOT_COUNT="$(awk -F'\t'      '$1=="NOT_COMPLIANT"{c++} END{print c+0}' "$TMP_RES")"
 SKIPPED_COUNT="$(awk -F'\t'  '$1=="SKIPPED"{c++} END{print c+0}' "$TMP_RES")"
 CHECKED=$(( COMPLIANT_COUNT + NOT_COUNT ))
 
-pct(){ awk -v n="$1" -v d="$2" 'BEGIN{ if (d==0) printf "0.0"; else printf "%.1f", (n*100.0)/d }'; }
+pct() { awk -v n="$1" -v d="$2" 'BEGIN{ if (d==0) printf "0.0"; else printf "%.1f", (n*100.0)/d }'; }
 
 hr
 echo "${BOLD}Summary${RESET}"
