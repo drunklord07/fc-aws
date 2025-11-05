@@ -1,0 +1,184 @@
+#!/usr/bin/env bash
+# Audit: S3 buckets publicly writeable via ACL (AllUsers -> WRITE)
+# Requirements: AWS CLI v2+, bash, standard coreutils. Uses default AWS creds.
+# Optional: set CONCURRENCY=N to adjust parallel processing (default 8).
+
+# --------- Config ---------
+CONCURRENCY="${CONCURRENCY:-8}"
+
+# --------- Setup ---------
+set -u
+TMP_DIR="$(mktemp -d 2>/dev/null || mktemp -d -t s3audit)"
+RESULT_DIR="$TMP_DIR/out"
+ERR_DIR="$TMP_DIR/err"
+PROG_FIFO="$TMP_DIR/prog.fifo"
+TABLE_TSV="$TMP_DIR/table.tsv"
+RESULTS_TSV="$TMP_DIR/results.tsv"
+BUCKETS_TXT="$TMP_DIR/buckets.txt"
+
+mkdir -p "$RESULT_DIR" "$ERR_DIR"
+trap 'tput cnorm 2>/dev/null || true; rm -rf "$TMP_DIR"' EXIT
+
+# Hide cursor for nicer progress bar (best effort)
+tput civis 2>/dev/null || true
+
+# --------- Get bucket list ---------
+if ! aws s3api list-buckets --query 'Buckets[].Name' --output text >"$BUCKETS_TXT" 2>"$TMP_DIR/_list_err.txt"; then
+  tput cnorm 2>/dev/null || true
+  echo "ERROR: Failed to list buckets. Details:"
+  sed -n '1,5p' "$TMP_DIR/_list_err.txt"
+  exit 1
+fi
+
+# Convert tabs to newlines (AWS CLI outputs tab-separated when using --output text)
+tr '\t' '\n' < "$BUCKETS_TXT" | sed '/^$/d' > "$TMP_DIR/_buckets_clean.txt"
+mv "$TMP_DIR/_buckets_clean.txt" "$BUCKETS_TXT"
+
+TOTAL="$(wc -l < "$BUCKETS_TXT" | tr -d ' ')"
+if [ "$TOTAL" -eq 0 ]; then
+  tput cnorm 2>/dev/null || true
+  echo "No S3 buckets found in this account."
+  exit 0
+fi
+
+# --------- Progress monitor ---------
+mkfifo "$PROG_FIFO"
+
+progress_monitor() {
+  TOTAL="$1"
+  FIFO="$2"
+  COMPLETED=0
+  WIDTH=40
+  while read -r _; do
+    COMPLETED=$((COMPLETED+1))
+    [ "$TOTAL" -gt 0 ] || TOTAL=1
+    DONE=$((COMPLETED*WIDTH/TOTAL))
+    # build bar segments
+    HASHES=""
+    if [ "$DONE" -gt 0 ]; then
+      HASHES="$(printf "%0.s#" $(seq 1 $DONE))"
+    fi
+    DOTS=""
+    REM=$((WIDTH-DONE))
+    if [ "$REM" -gt 0 ]; then
+      DOTS="$(printf "%0.s." $(seq 1 $REM))"
+    fi
+    PCT=$((COMPLETED*100/TOTAL))
+    printf "\rProgress: [%s%s] %3d%% (%d/%d)" "$HASHES" "$DOTS" "$PCT" "$COMPLETED" "$TOTAL"
+  done < "$FIFO"
+  printf "\n"
+}
+
+progress_monitor "$TOTAL" "$PROG_FIFO" &
+PROG_PID=$!
+
+# --------- Capability check for parallel xargs ---------
+# If xargs doesn't support -P, fall back to serial
+if ! printf "" | xargs -P 2 echo >/dev/null 2>&1; then
+  CONCURRENCY=1
+fi
+
+# --------- Worker launcher ---------
+# For each bucket:
+#  - Query AllUsers (everyone) grants and collect Permission list
+#  - Mark NONCOMPLIANT if "WRITE" is present; else COMPLIANT
+#  - On CLI error: ERROR
+#  - Write per-bucket TSV: "<bucket>\t<STATUS>\t<AllUsersPermissions>"
+#  - Signal progress by writing a byte to FIFO
+
+# shellcheck disable=SC2016
+xargs -P "$CONCURRENCY" -I {} bash -c '
+  bucket="$1"
+  outdir="$2"
+  errdir="$3"
+  fifo="$4"
+
+  # Query AllUsers permissions. Using single quotes inside JMESPath avoids backtick issues.
+  perm="$(aws s3api get-bucket-acl \
+    --bucket "$bucket" \
+    --query "Grants[?Grantee.URI=='"'"'http://acs.amazonaws.com/groups/global/AllUsers'"'"'].Permission" \
+    --output text 2>"$errdir/$bucket.err")"
+  rc=$?
+
+  status=""
+  if [ $rc -ne 0 ]; then
+    status="ERROR"
+    perm=""
+  else
+    # perm may be empty, or include one/more of READ WRITE FULL_CONTROL WRITE_ACP READ_ACP (space/newline separated)
+    if echo "$perm" | grep -qw WRITE; then
+      status="NONCOMPLIANT"
+    else
+      status="COMPLIANT"
+    fi
+  fi
+
+  printf "%s\t%s\t%s\n" "$bucket" "$status" "$perm" > "$outdir/$bucket.tsv"
+  # Signal progress
+  printf "." > "$fifo"
+' _ {} "$RESULT_DIR" "$ERR_DIR" "$PROG_FIFO" < "$BUCKETS_TXT"
+
+# Close progress (reader exits when writers are gone)
+wait "$PROG_PID" 2>/dev/null || true
+tput cnorm 2>/dev/null || true
+
+# --------- Aggregate results ---------
+cat "$RESULT_DIR"/*.tsv > "$RESULTS_TSV"
+
+COMPLIANT_COUNT=$(grep -c $'\tCOMPLIANT\t' "$RESULTS_TSV" 2>/dev/null || echo 0)
+NONCOMPLIANT_COUNT=$(grep -c $'\tNONCOMPLIANT\t' "$RESULTS_TSV" 2>/dev/null || echo 0)
+ERROR_COUNT=$(grep -c $'\tERROR\t' "$RESULTS_TSV" 2>/dev/null || echo 0)
+CHECKED=$((COMPLIANT_COUNT + NONCOMPLIANT_COUNT + ERROR_COUNT))
+
+# Build display table
+{
+  printf "BUCKET\tSTATUS\tALLUSERS_PERMISSIONS\n"
+  cat "$RESULTS_TSV"
+} > "$TABLE_TSV"
+
+# Try to pretty-print with column; fallback to raw
+if command -v column >/dev/null 2>&1; then
+  echo
+  echo "S3 Bucket ACL Audit (AllUsers → WRITE exposure)"
+  echo "------------------------------------------------"
+  column -t -s $'\t' "$TABLE_TSV"
+else
+  echo
+  echo "S3 Bucket ACL Audit (AllUsers → WRITE exposure)"
+  echo "------------------------------------------------"
+  cat "$TABLE_TSV"
+fi
+
+# --------- Summary ---------
+echo
+echo "Summary"
+echo "-------"
+printf "Total buckets discovered : %d\n" "$TOTAL"
+printf "Checked (processed)      : %d\n" "$CHECKED"
+printf "Compliant                : %d\n" "$COMPLIANT_COUNT"
+printf "Non-compliant (public WRITE) : %d\n" "$NONCOMPLIANT_COUNT"
+printf "Errors                   : %d\n" "$ERROR_COUNT"
+printf "Skipped                  : %d\n" 0
+
+# Optional: list non-compliant buckets
+if [ "$NONCOMPLIANT_COUNT" -gt 0 ]; then
+  echo
+  echo "Non-compliant buckets (public WRITE detected):"
+  awk -F'\t' '$2=="NONCOMPLIANT"{print " - " $1}' "$RESULTS_TSV" | sort
+fi
+
+# Optional: brief error preview
+if [ "$ERROR_COUNT" -gt 0 ]; then
+  echo
+  echo "Errors (first line per bucket):"
+  for f in "$ERR_DIR"/*.err; do
+    b="$(basename "$f" .err)"
+    # show an error only if that bucket ended in ERROR
+    if grep -q $'\tERROR\t' "$RESULTS_TSV" && grep -q "^$b"$'\tERROR\t' "$RESULTS_TSV"; then
+      printf " - %s: " "$b"
+      sed -n '1p' "$f"
+    fi
+  done
+fi
+
+exit 0
