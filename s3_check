@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # S3 Public WRITE ACL Audit (parallel + progress bar; AWS CLI only)
 # Rule: NOT_COMPLIANT if bucket ACL grants AllUsers -> WRITE; else COMPLIANT.
-# Output: table of buckets + summary counts. Skips include a reason.
+# Output: table of ALL buckets + summary. Skips include a clear reason.
+# Log file: ./s3_acl_public_write_audit.log
 
 export AWS_PAGER=""
 
@@ -24,6 +25,8 @@ case "$JOBS" in (''|*[!0-9]*) JOBS=16;; esac
 
 ACCOUNT="$(aws sts get-caller-identity --query 'Account' --output text 2>/dev/null || echo UNKNOWN)"
 ARN="$(aws sts get-caller-identity --query 'Arn' --output text 2>/dev/null || echo UNKNOWN)"
+LOG_FILE="$PWD/s3_acl_public_write_audit.log"
+: > "$LOG_FILE"
 
 # ---- Temp files ----
 TMP_LIST="$(mktemp -t s3_buckets.XXXXXX)"
@@ -41,7 +44,6 @@ if ! aws s3api list-buckets --query 'Buckets[].Name' --output text 2>/dev/null >
   echo "${DIM}Rule: NOT_COMPLIANT if ACL grants AllUsers -> WRITE; otherwise COMPLIANT.${RESET}"
   exit 0
 fi
-# split tabs to lines; drop empties
 tr '\t' '\n' < "$TMP_LIST" | sed '/^$/d' > "${TMP_LIST}.clean"
 mv "${TMP_LIST}.clean" "$TMP_LIST"
 
@@ -100,29 +102,38 @@ exec 3<>"$SEM"; rm -f "$SEM"
 k=0; while [ $k -lt "$JOBS" ]; do echo >&3; k=$((k+1)); done
 
 # ---- Worker: check one bucket ----
-# Output format per line (tab-separated):
+# Output per line (tab-separated):
 # STATUS  BUCKET  ALLUSERS_PERMISSIONS  REASON
 # STATUS ∈ {COMPLIANT, NOT_COMPLIANT, SKIPPED}
 check_one() {
   bkt="$1"
 
-  # Query AllUsers grants; capture stdout/stderr
-  # JMESPath literal uses backticks inside a single-quoted --query
-  out_and_err="$(aws s3api get-bucket-acl \
+  # Query AllUsers grants; capture stdout+stderr
+  raw="$(aws s3api get-bucket-acl \
       --bucket "$bkt" \
       --query 'Grants[?Grantee.URI==`http://acs.amazonaws.com/groups/global/AllUsers`].Permission' \
       --output text 2>&1)"
   rc=$?
 
   if [ $rc -ne 0 ]; then
-    # Example: "An error occurred (AccessDenied) when calling the GetBucketAcl operation: Access Denied"
-    reason="$(printf '%s\n' "$out_and_err" | sed -n '1p')"
-    printf "SKIPPED\t%s\t\t%s\n" "$bkt" "$reason" >> "$TMP_RES"
+    # Normalize a clear single-line reason
+    reason="$(printf '%s\n' "$raw" | head -n1 | tr '\t' ' ' | tr -d '\r')"
+    echo "$bkt | ERROR | $reason" >> "$LOG_FILE"
+
+    # Simplify common AWS errors
+    shrt="$reason"
+    echo "$reason" | grep -qi 'AccessDenied'   && shrt='AccessDenied on GetBucketAcl'
+    echo "$reason" | grep -qi 'NoSuchBucket'   && shrt='NoSuchBucket'
+    echo "$reason" | grep -qi 'ExpiredToken'   && shrt='ExpiredToken'
+    echo "$reason" | grep -qi 'SignatureDoesNotMatch' && shrt='BadSignature'
+    echo "$reason" | grep -qi 'AllAccessDisabled' && shrt='AllAccessDisabled'
+
+    printf "SKIPPED\t%s\t\t%s\n" "$bkt" "$shrt" >> "$TMP_RES"
     return
   fi
 
-  perms="$(printf '%s' "$out_and_err" | tr '\t' ' ' | sed 's/[[:space:]]\+/ /g;s/^ //;s/ $//')"
-  # perms may be empty or contain: READ WRITE FULL_CONTROL READ_ACP WRITE_ACP
+  # Success path
+  perms="$(printf '%s' "$raw" | tr '\t' ' ' | sed 's/[[:space:]]\+/ /g; s/^ //; s/ $//')"
   if printf '%s\n' "$perms" | grep -qw WRITE; then
     printf "NOT_COMPLIANT\t%s\t%s\tAllUsers has WRITE\n" "$bkt" "$perms" >> "$TMP_RES"
   else
@@ -137,16 +148,14 @@ check_one() {
 # ---- Start progress and workers ----
 progress_loop "$TMP_RES" "$TOTAL" & PROG_PID=$!
 
-# Queue jobs (one per bucket)
 while IFS= read -r bucket; do
-  read -r -u 3   # acquire token
+  read -r -u 3
   {
     check_one "$bucket"
-    echo >&3     # return token
+    echo >&3
   } &
 done < "$TMP_LIST"
 
-# Wait for all jobs & progress
 wait
 wait "$PROG_PID" 2>/dev/null || true
 
@@ -182,16 +191,17 @@ printf "Skipped         : %s\n" "$SKIPPED_COUNT"
 hr
 echo "${DIM}Rule: NOT_COMPLIANT if ACL grants AllUsers -> WRITE; otherwise COMPLIANT.${RESET}"
 
-# Optional: quick list of NOT_COMPLIANT buckets
+# Optional: quick lists
 if [ "$NOT_COUNT" -gt 0 ]; then
   echo
   echo "${RED}Non-compliant buckets (public WRITE):${RESET}"
   awk -F'\t' '$1=="NOT_COMPLIANT"{print " - " $2}' "$TMP_RES" | sort
 fi
 
-# Optional: show skip reasons
 if [ "$SKIPPED_COUNT" -gt 0 ]; then
   echo
   echo "${YELLOW}Skipped (with reason):${RESET}"
   awk -F'\t' '$1=="SKIPPED"{printf " - %s: %s\n",$2,($4==""?"Unknown":$4)}' "$TMP_RES"
+  echo
+  echo "${DIM}Full error text saved to:${RESET} $LOG_FILE"
 fi
